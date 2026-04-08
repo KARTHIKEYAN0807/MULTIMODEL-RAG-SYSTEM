@@ -91,9 +91,10 @@ async function chunkAndInsertText(text: string, fileName: string, folder?: strin
     const chunk = chunks[i].trim();
     if (!chunk) continue;
 
-    const embedding = await getOllamaEmbedding(chunk);
+    const enrichedChunk = `[Source: ${fileName}${folder ? ` | Folder: ${folder}` : ''}]\n\n${chunk}`;
+    const embedding = await getOllamaEmbedding(enrichedChunk);
     const { error } = await supabase.from('documents').insert({
-      content: chunk,
+      content: enrichedChunk,
       embedding,
       metadata: { source: fileName, type: 'text', chunkIndex: i, ...(folder ? { folder } : {}) }
     });
@@ -207,9 +208,10 @@ export async function POST(req: Request) {
       const description = await describeImageWithLlava(base64Image);
 
       if (description) {
-        const embedding = await getOllamaEmbedding(description);
+        const enrichedDescription = `[Image File: ${file.name}${folder ? ` | Folder: ${folder}` : ''}]\n\n${description}`;
+        const embedding = await getOllamaEmbedding(enrichedDescription);
         const { error: dbError } = await supabase.from('documents').insert({
-          content: description,
+          content: enrichedDescription,
           embedding,
           metadata: { source: file.name, type: 'image', imageUrl, ...(folder ? { folder } : {}) }
         });
@@ -263,9 +265,10 @@ export async function POST(req: Request) {
           const description = await describeImageWithLlava(base64Image);
 
           if (description) {
-            const embedding = await getOllamaEmbedding(description);
+            const enrichedDescription = `[Image from PDF: ${file.name}${folder ? ` | Folder: ${folder}` : ''}]\n\n${description}`;
+            const embedding = await getOllamaEmbedding(enrichedDescription);
             const { error: dbError } = await supabase.from('documents').insert({
-              content: description,
+              content: enrichedDescription,
               embedding,
               metadata: { source: file.name, type: 'image', imageUrl, pageIndex: i, ...(folder ? { folder } : {}) }
             });

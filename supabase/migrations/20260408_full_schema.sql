@@ -1,13 +1,15 @@
--- ============================================
--- Migration: Hard Reset for 1024-Dimension Vectors (mxbai-embed-large)
--- ============================================
+-- ================================================================================
+-- Master Migration: Consolidated Schema for Multimodal RAG
+-- Dimensions: 1024 (mxbai-embed-large)
+-- Includes: Documents Table, HNSW Vector Index, Full-Text Search, Hybrid Search RPC
+-- ================================================================================
 
--- 1. Obliterate old data/schema
+-- 1. EXTENSIONS
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- 2. TABLES
 DROP TABLE IF EXISTS public.documents CASCADE;
-DROP FUNCTION IF EXISTS hybrid_search(text, vector(768), int, float, float, float) CASCADE;
-DROP FUNCTION IF EXISTS documents_fts_trigger CASCADE;
 
--- 2. Create the NEW documents table (1024 dimensions)
 CREATE TABLE public.documents (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   content text NOT NULL,
@@ -17,11 +19,17 @@ CREATE TABLE public.documents (
   fts tsvector
 );
 
--- 3. Create Indexes
-CREATE INDEX IF NOT EXISTS documents_embedding_idx ON public.documents USING hnsw (embedding vector_cosine_ops);
+-- 3. INDEXES
+-- HNSW Vector Index for Cosine Similarity
+CREATE INDEX IF NOT EXISTS documents_embedding_idx ON public.documents 
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+-- GIN Index for Full-Text Search
 CREATE INDEX IF NOT EXISTS documents_fts_idx ON public.documents USING gin (fts);
 
--- 4. Re-apply Full-Text Search Auto-Trigger
+-- 4. TRIGGERS
+-- Auto-update Full-Text Search vector on content changes
 CREATE OR REPLACE FUNCTION documents_fts_trigger() RETURNS trigger AS $$
 BEGIN
   NEW.fts := to_tsvector('english', NEW.content);
@@ -33,7 +41,8 @@ CREATE TRIGGER documents_fts_update
   BEFORE INSERT OR UPDATE ON public.documents
   FOR EACH ROW EXECUTE FUNCTION documents_fts_trigger();
 
--- 5. Recreate Hybrid Search (now targeting 1024 dims)
+-- 5. HYBRID SEARCH RPC
+-- Combines Vector Similarity and BM25-style Text Search
 CREATE OR REPLACE FUNCTION hybrid_search(
   query_text text,
   query_embedding vector(1024),
@@ -51,7 +60,7 @@ RETURNS TABLE (
 )
 LANGUAGE sql STABLE
 AS $$
-  -- Vector results
+  -- Vector search (Cosine distance reversed)
   (SELECT
     d.id,
     d.content,
@@ -65,15 +74,15 @@ AS $$
 
   UNION ALL
 
-  -- Full-text (BM25-style) results
+  -- Text search (using websearch_to_tsquery for better phrase/OR matching)
   (SELECT
     d.id,
     d.content,
     d.metadata,
-    ts_rank_cd(d.fts, plainto_tsquery('english', query_text)) * text_weight AS similarity,
+    ts_rank_cd(d.fts, websearch_to_tsquery('english', query_text)) * text_weight AS similarity,
     'keyword'::text AS search_type
   FROM public.documents d
-  WHERE d.fts @@ plainto_tsquery('english', query_text)
-  ORDER BY ts_rank_cd(d.fts, plainto_tsquery('english', query_text)) DESC
+  WHERE d.fts @@ websearch_to_tsquery('english', query_text)
+  ORDER BY ts_rank_cd(d.fts, websearch_to_tsquery('english', query_text)) DESC
   LIMIT match_count)
 $$;

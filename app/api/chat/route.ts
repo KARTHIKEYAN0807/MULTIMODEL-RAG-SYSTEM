@@ -402,9 +402,15 @@ export async function POST(req: Request) {
       }
     }
 
-    // ─── STEP X: Force-Inject Recent Image context ───────────────────────
+    // ─── STEP X: Smart Fallback for "Latest Image" queries ────────────────
     let recentImageContext = "";
-    if (lowerQuery.includes('image') || lowerQuery.includes('picture') || lowerQuery.includes('photo')) {
+    const askedForLatestImage = lowerQuery.includes('latest image') || lowerQuery.includes('last image') || lowerQuery.includes('recent image');
+    
+    // Check if the hybrid search already found an image
+    const foundImageInSearch = topDocuments.some(doc => doc.metadata?.type === 'image');
+
+    if (askedForLatestImage && !foundImageInSearch) {
+      console.log(`[RAG] User explicitly asked for latest image but search missed it. Fetching fallback...`);
       const { data: imageDocs } = await supabase
         .from('documents')
         .select('*')
@@ -413,7 +419,7 @@ export async function POST(req: Request) {
         .limit(1);
 
       if (imageDocs && imageDocs.length > 0) {
-        recentImageContext = `[RECENTLY UPLOADED IMAGE ANALYSIS]:\n${imageDocs[0].content}\n\n`;
+        recentImageContext = `[RECENTLY UPLOADED IMAGE ANALYSIS (Fallback)]: \n${imageDocs[0].content}\n\n`;
         sources.add(imageDocs[0].metadata?.source || "Uploaded Image");
       }
     }
