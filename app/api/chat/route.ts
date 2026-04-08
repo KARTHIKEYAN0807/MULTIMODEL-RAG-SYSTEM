@@ -402,25 +402,51 @@ export async function POST(req: Request) {
       }
     }
 
-    // ─── STEP X: Smart Fallback for "Latest Image" queries ────────────────
+    // ─── STEP X: Dedicated Image Retrieval (Multimodal Support) ────────────
     let recentImageContext = "";
     const askedForLatestImage = lowerQuery.includes('latest image') || lowerQuery.includes('last image') || lowerQuery.includes('recent image');
     
     // Check if the hybrid search already found an image
     const foundImageInSearch = topDocuments.some(doc => doc.metadata?.type === 'image');
 
-    if (askedForLatestImage && !foundImageInSearch) {
-      console.log(`[RAG] User explicitly asked for latest image but search missed it. Fetching fallback...`);
-      const { data: imageDocs } = await supabase
+    if (!foundImageInSearch) {
+      // 1. Try to find an image that directly matches the query text (filename or description)
+      const cleanQuery = lowerQuery.replace(/[^\w\s]/g, '').trim();
+      const queryWords = cleanQuery.split(/\s+/).filter((w: string) => w.length > 2);
+      
+      let imgSearchQuery = supabase
         .from('documents')
-        .select('*')
-        .eq('metadata->>type', 'image')
-        .order('created_at', { ascending: false })
-        .limit(1);
+        .select('id, content, metadata')
+        .eq('metadata->>type', 'image');
 
-      if (imageDocs && imageDocs.length > 0) {
-        recentImageContext = `[RECENTLY UPLOADED IMAGE ANALYSIS (Fallback)]: \n${imageDocs[0].content}\n\n`;
-        sources.add(imageDocs[0].metadata?.source || "Uploaded Image");
+      if (queryWords.length > 0) {
+        const orConditions = queryWords.map((w: string) => `metadata->>source.ilike.%${w}%,content.ilike.%${w}%`).join(',');
+        imgSearchQuery = imgSearchQuery.or(orConditions);
+      }
+
+      const { data: matchingImages, error: imgSearchError } = await imgSearchQuery.limit(1);
+
+      if (!imgSearchError && matchingImages && matchingImages.length > 0) {
+        recentImageContext = `[RELEVANT IMAGE MATCH (Source: ${matchingImages[0].metadata?.source || "Uploaded Image"})]: \n${matchingImages[0].content}\n\n`;
+        sources.add(matchingImages[0].metadata?.source || "Uploaded Image");
+        pinnedIds.add(matchingImages[0].id);
+        console.log(`[RAG] Pinned relevant image missing from top K: ${matchingImages[0].metadata?.source}`);
+      }
+      // 2. Fallback: If no direct match but user explicitly asked for the latest image
+      else if (askedForLatestImage) {
+        console.log(`[RAG] User explicitly asked for latest image but search missed it. Fetching fallback...`);
+        const { data: imageDocs } = await supabase
+          .from('documents')
+          .select('id, content, metadata')
+          .eq('metadata->>type', 'image')
+          .order('created_at', { ascending: false })
+          .limit(1);
+
+        if (imageDocs && imageDocs.length > 0) {
+          recentImageContext = `[RECENTLY UPLOADED IMAGE ANALYSIS (Fallback)]: \n${imageDocs[0].content}\n\n`;
+          sources.add(imageDocs[0].metadata?.source || "Uploaded Image");
+          pinnedIds.add(imageDocs[0].id);
+        }
       }
     }
 

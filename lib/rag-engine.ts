@@ -136,11 +136,30 @@ export async function performFullRetrieval(query: string) {
   // 3. Fusion
   const fusedResults = reciprocalRankFusion(allResultSets);
 
-  // 4. Heuristic: Force-Inject Recent Image context if query matches
+  // 4. Heuristic: Dedicated Image Retrieval
   let imageContext = "";
   let imageSource = "";
   const lowerQuery = query.toLowerCase();
-  if (lowerQuery.includes('image') || lowerQuery.includes('picture') || lowerQuery.includes('photo')) {
+
+  const cleanQuery = lowerQuery.replace(/[^\w\s]/g, '').trim();
+  const queryWords = cleanQuery.split(/\s+/).filter((w: string) => w.length > 2);
+  
+  let imgSearchQuery = supabase
+    .from('documents')
+    .select('id, content, metadata')
+    .eq('metadata->>type', 'image');
+
+  if (queryWords.length > 0) {
+    const orConditions = queryWords.map((w: string) => `metadata->>source.ilike.%${w}%,content.ilike.%${w}%`).join(',');
+    imgSearchQuery = imgSearchQuery.or(orConditions);
+  }
+
+  const { data: matchingImages, error: imgSearchError } = await imgSearchQuery.limit(1);
+
+  if (!imgSearchError && matchingImages && matchingImages.length > 0) {
+    imageContext = `[RELEVANT IMAGE MATCH (Source: ${matchingImages[0].metadata?.source || "Uploaded Image"})]:\n${matchingImages[0].content}\n\n`;
+    imageSource = matchingImages[0].metadata?.source || "Uploaded Image";
+  } else if (lowerQuery.includes('image') || lowerQuery.includes('picture') || lowerQuery.includes('photo')) {
     const { data: imageDocs } = await supabase
       .from('documents')
       .select('*')
@@ -149,7 +168,7 @@ export async function performFullRetrieval(query: string) {
       .limit(1);
 
     if (imageDocs && imageDocs.length > 0) {
-      imageContext = `[RECENTLY UPLOADED IMAGE ANALYSIS]:\n${imageDocs[0].content}\n\n`;
+      imageContext = `[RECENTLY UPLOADED IMAGE ANALYSIS (Fallback)]:\n${imageDocs[0].content}\n\n`;
       imageSource = imageDocs[0].metadata?.source || "Uploaded Image";
     }
   }
