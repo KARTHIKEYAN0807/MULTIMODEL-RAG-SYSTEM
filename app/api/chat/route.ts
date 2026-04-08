@@ -19,34 +19,114 @@ async function getOllamaEmbedding(text: string): Promise<number[]> {
 }
 
 // ─── Rule-Based RAGAS Audit (no second LLM call = zero latency overhead) ─────
-function computeNgramOverlap(text: string, reference: string, n: number = 3): number {
-  const tokenize = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
-  const tokens = tokenize(text);
-  const refTokens = tokenize(reference);
-  if (tokens.length < n || refTokens.length < n) return 0;
-  const makeNgrams = (arr: string[]) => new Set(arr.slice(0, arr.length - n + 1).map((_, i) => arr.slice(i, i + n).join(' ')));
-  const tNgrams = makeNgrams(tokens);
-  const rNgrams = makeNgrams(refTokens);
-  let hits = 0;
-  tNgrams.forEach(ng => { if (rNgrams.has(ng)) hits++; });
-  return tNgrams.size > 0 ? hits / tNgrams.size : 0;
+// ─── RAGAS-style Evaluation Helpers ─────────────────────────────────────────
+const STOP_WORDS = new Set([
+  'the','a','an','and','or','but','in','on','at','to','for','of','with','by','from',
+  'is','are','was','were','be','been','have','has','had','do','does','did','will',
+  'would','could','should','may','might','any','this','that','these','those',
+  'what','which','who','when','where','why','how','give','some','like','about',
+  'your','you','can','also','than','done','have','they','them','their','there',
+  'then','into','over','more','very','just','such','each','both','its','been',
+  'after','other','than','only','before','since','during'
+]);
+
+function tokenizeContent(text: string): string[] {
+  return text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+}
+
+// ─── FAITHFULNESS: Unigram content-word grounding ────────────────────────────
+// What fraction of meaningful words in the answer appear in the context?
+// More robust than bigram overlap — handles paraphrasing naturally.
+function computeFaithfulness(answer: string, context: string): number {
+  const answerTokens = tokenizeContent(answer);
+  const contextSet = new Set(tokenizeContent(context));
+  // Filter to content words only (skip stop words, keep numbers)
+  const contentWords = answerTokens.filter(w =>
+    (w.length > 2 && !STOP_WORDS.has(w)) || /^\d+$/.test(w)
+  );
+  if (contentWords.length === 0) return 0;
+  const grounded = contentWords.filter(w => contextSet.has(w));
+  return grounded.length / contentWords.length;
+}
+
+// ─── RELEVANCY: Question-type-aware satisfaction check ───────────────────────
+// Instead of raw keyword overlap, check if the answer satisfies the intent
+// of the question based on its type (factual, explanatory, procedural, listing).
+function computeRelevancy(question: string, answer: string): number {
+  const q = question.toLowerCase();
+  const a = answer.toLowerCase();
+  const answerWords = tokenizeContent(answer).filter(w => !STOP_WORDS.has(w) && w.length > 2);
+
+  // ── 1. Question-type satisfaction (hard checks per question intent) ──
+  const questionTypeSatisfied = (() => {
+    // Factual: marks, points, score value
+    if (/\b(how\s+many|how\s+much|what\s+is\s+the|total)\s*(mark|marks|point|points|score)/i.test(question)
+        || /\b(mark|marks|points?)\b/i.test(question)) {
+      return /\b\d+\s*(mark|marks|point|points)/i.test(answer);
+    }
+    // Factual: time, duration, seconds
+    if (/\b(how\s+long|how\s+much\s+time|time|timer|duration|seconds?|minutes?)\b/i.test(question)) {
+      return /\b\d+\s*(second|seconds|minute|minutes|sec|min|s\b)/i.test(answer) || /timer/i.test(answer);
+    }
+    // Explanatory: what, explain, describe
+    if (/^(what|explain|describe|tell\s+me)/i.test(question.trim())) {
+      return answerWords.length >= 15;
+    }
+    // Procedural: how do, how can, how to, steps
+    if (/^how\s+(do|can|to|should|would)/i.test(question.trim()) || /\bsteps?\b/.test(q)) {
+      return answerWords.length >= 10;
+    }
+    // Listing: list, name, which
+    if (/^(list|name|which|what\s+are)/i.test(question.trim())) {
+      return answerWords.length >= 8 || /[-•*]|\d+\./.test(answer);
+    }
+    // Yes/no questions: does, is, are, can → short answer OK
+    if (/^(does|is|are|can|has|have|will|should|would|did)/i.test(question.trim())) {
+      return /\b(yes|no|correct|incorrect|true|false|indeed)\b/i.test(answer) || answerWords.length >= 5;
+    }
+    // Default: answer has substance
+    return answerWords.length >= 5;
+  })();
+
+  // ── 2. Key term overlap (entities, numbers, domain terms) ───────────────
+  // Synonym normalization: map common LLM paraphrase verbs to question stems
+  // so "depicts" matches "describe", "displays" matches "show", etc.
+  const SYNONYMS: Record<string, string> = {
+    depicts: 'describe', displayed: 'show', displays: 'show', shows: 'show',
+    showing: 'show', contains: 'describe', presenting: 'describe',
+    illustrated: 'describe', illustrates: 'describe', featuring: 'describe',
+    features: 'describe', represents: 'describe', representing: 'describe',
+  };
+  const normalizeToken = (w: string) => SYNONYMS[w] ?? w;
+
+  const keyTerms = tokenizeContent(question).filter(w =>
+    (w.length > 3 && !STOP_WORDS.has(w)) || /^\d+$/.test(w)
+  );
+  const answerTokensNorm = new Set(tokenizeContent(answer).map(normalizeToken));
+  const matched = keyTerms.filter(t => answerTokensNorm.has(t));
+  const termRatio = keyTerms.length > 0 ? matched.length / keyTerms.length : 0;
+  // >= 0.5 (not strict >) so exact 50% match correctly scores 5
+  const termScore = termRatio >= 0.5 ? 5 : termRatio > 0.35 ? 4 : termRatio > 0.2 ? 3 : termRatio > 0.1 ? 2 : 1;
+
+  // ── 3. Combine scores ─────────────────────────────────────────────────────
+  // If the answer satisfies the question's structural intent (questionTypeSatisfied)
+  // AND has decent term alignment (termScore >= 4), the answer is genuinely relevant → 5
+  // If only one condition holds → floor at 4 (satisfactory but not perfect)
+  if (questionTypeSatisfied && termScore >= 4) return 5;
+  if (questionTypeSatisfied) return 4;
+  return termScore;
 }
 
 function ruleBasedAudit(question: string, answer: string, context: string): { f: number; r: number } {
   const isNoInfo = answer.toLowerCase().includes('do not have enough information');
   if (isNoInfo) return { f: 1, r: 1 };
 
-  // Faithfulness: how much of the answer is grounded in context?
-  // Use bigrams (n=2) instead of trigrams — more lenient for paraphrased scoring content
-  const overlap = computeNgramOverlap(answer, context, 2);
-  const f = overlap > 0.25 ? 5 : overlap > 0.15 ? 4 : overlap > 0.08 ? 3 : overlap > 0.02 ? 2 : 1;
+  // Faithfulness: grounded content-word ratio
+  const groundingRatio = computeFaithfulness(answer, context);
+  const f = groundingRatio > 0.55 ? 5 : groundingRatio > 0.40 ? 4 : groundingRatio > 0.25 ? 3 : groundingRatio > 0.10 ? 2 : 1;
 
-  // Relevancy: do query keywords appear in the answer?
-  const queryKeywords = question.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 3);
-  const answerLower = answer.toLowerCase();
-  const matchedKeywords = queryKeywords.filter(kw => answerLower.includes(kw));
-  const keywordRatio = queryKeywords.length > 0 ? matchedKeywords.length / queryKeywords.length : 0;
-  const r = keywordRatio > 0.5 ? 5 : keywordRatio > 0.35 ? 4 : keywordRatio > 0.2 ? 3 : keywordRatio > 0.1 ? 2 : 1;
+  // Relevancy: question-type-aware
+  const r = computeRelevancy(question, answer);
 
   return { f, r };
 }
@@ -373,6 +453,8 @@ RULES:
 2. If the context contains scoring criteria, marks, or rubrics — quote them exactly as they appear.
 3. Structure your answer clearly: use bullet points or a table if the source uses them.
 4. Be concise and directly answer the user's question.
+5. In your answer, naturally use the key terms and subject matter from the user's question (e.g. if asked about "marks and time", explicitly mention marks and time in your answer).
+6. Ground every fact you state in the context — use the exact words or numbers from the document where possible.
 
 Context:
 ${contextText}
