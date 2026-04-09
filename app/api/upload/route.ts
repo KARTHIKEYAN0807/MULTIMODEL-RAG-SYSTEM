@@ -38,54 +38,141 @@ async function describeImageWithLlava(base64Image: string): Promise<string> {
   return data.response || '';
 }
 
-const CHUNK_SIZE = 500;
-const CHUNK_OVERLAP = 100;
+// ─── True Semantic Chunking Configuration ───────────────────────────────────
+const BREAKPOINT_STDDEV_FACTOR = 1.0; // Break where similarity < (mean - factor × stddev)
+const SENTENCE_WINDOW = 3;          // Sentences per embedding group (sliding window)
+const MAX_CHUNK_SIZE = 800;         // Hard cap per chunk (chars)
+const MIN_CHUNK_SIZE = 100;         // Merge tiny chunks with their neighbor
+
+// ─── Semantic Chunking Helpers ──────────────────────────────────────────────
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+  const magnitude = Math.sqrt(magA) * Math.sqrt(magB);
+  return magnitude === 0 ? 0 : dot / magnitude;
+}
+
+function splitIntoSentences(text: string): string[] {
+  // Split on sentence-ending punctuation or line breaks, keeping punctuation
+  const raw = text.match(/[^.!?\n]+(?:[.!?]+|\n+|$)/g) || [text];
+  return raw
+    .map(s => s.trim())
+    .filter(s => s.length > 10); // Filter noise (empty/tiny fragments)
+}
+
+/**
+ * True Semantic Chunking — uses embedding similarity to detect topic boundaries.
+ *
+ * Algorithm:
+ *   1. Split text into sentences
+ *   2. Create sliding windows of SENTENCE_WINDOW consecutive sentences
+ *   3. Embed each window via mxbai-embed-large
+ *   4. Compute cosine similarity between consecutive window embeddings
+ *   5. Adaptive breakpoint detection: break where similarity drops below
+ *      (mean - BREAKPOINT_STDDEV_FACTOR × standard_deviation)
+ *   6. Assemble final chunks; enforce MAX/MIN size limits
+ */
+async function semanticChunkText(text: string, fileName: string): Promise<string[]> {
+  // 1. Split into sentences
+  const sentences = splitIntoSentences(text);
+
+  if (sentences.length <= SENTENCE_WINDOW) {
+    // Too few sentences — return as single chunk
+    return [sentences.join(' ')];
+  }
+
+  // 2. Create sentence windows (groups of SENTENCE_WINDOW consecutive sentences)
+  const windows: string[] = [];
+  for (let i = 0; i <= sentences.length - SENTENCE_WINDOW; i++) {
+    windows.push(sentences.slice(i, i + SENTENCE_WINDOW).join(' '));
+  }
+
+  // 3. Embed each window via existing Ollama embedding model
+  console.log(`[${fileName}] Semantic chunking: embedding ${windows.length} sentence windows...`);
+  const embeddings: number[][] = [];
+  for (const window of windows) {
+    const embedding = await getOllamaEmbedding(window);
+    embeddings.push(embedding);
+  }
+
+  // 4. Compute cosine similarity between consecutive window embeddings
+  const similarities: number[] = [];
+  for (let i = 0; i < embeddings.length - 1; i++) {
+    similarities.push(cosineSimilarity(embeddings[i], embeddings[i + 1]));
+  }
+
+  // 5. Adaptive breakpoint detection using mean - stddev
+  //    This automatically adapts to each document's similarity distribution
+  const mean = similarities.reduce((s, v) => s + v, 0) / similarities.length;
+  const variance = similarities.reduce((s, v) => s + (v - mean) ** 2, 0) / similarities.length;
+  const stddev = Math.sqrt(variance);
+  const adaptiveThreshold = mean - BREAKPOINT_STDDEV_FACTOR * stddev;
+
+  console.log(`[${fileName}] Similarity stats: mean=${mean.toFixed(3)}, stddev=${stddev.toFixed(3)}, adaptive threshold=${adaptiveThreshold.toFixed(3)}`);
+
+  const breakpoints: number[] = [];
+  for (let i = 0; i < similarities.length; i++) {
+    if (similarities[i] < adaptiveThreshold) {
+      // Break falls after the last sentence in window i
+      const sentenceBreak = i + SENTENCE_WINDOW;
+      if (sentenceBreak < sentences.length) {
+        breakpoints.push(sentenceBreak);
+      }
+    }
+  }
+
+  // 6. Assemble chunks from sentences between breakpoints
+  const rawChunks: string[] = [];
+  let start = 0;
+  for (const bp of breakpoints) {
+    const chunk = sentences.slice(start, bp).join(' ').trim();
+    if (chunk) rawChunks.push(chunk);
+    start = bp;
+  }
+  const lastChunk = sentences.slice(start).join(' ').trim();
+  if (lastChunk) rawChunks.push(lastChunk);
+
+  // 7. Post-process: enforce max size (recursive split) and merge tiny chunks
+  const finalChunks: string[] = [];
+  for (const chunk of rawChunks) {
+    if (chunk.length > MAX_CHUNK_SIZE) {
+      // Split oversized chunk by sentences as fallback
+      const subSentences = splitIntoSentences(chunk);
+      let current = '';
+      for (const s of subSentences) {
+        if (current.length + s.length > MAX_CHUNK_SIZE && current.length > 0) {
+          finalChunks.push(current.trim());
+          current = '';
+        }
+        current += s + ' ';
+      }
+      if (current.trim()) finalChunks.push(current.trim());
+    } else if (chunk.length < MIN_CHUNK_SIZE && finalChunks.length > 0) {
+      // Merge tiny chunk with previous
+      finalChunks[finalChunks.length - 1] += ' ' + chunk;
+    } else {
+      finalChunks.push(chunk);
+    }
+  }
+
+  console.log(`[${fileName}] Semantic chunking complete: ${sentences.length} sentences → ${windows.length} windows → ${breakpoints.length} topic boundaries → ${finalChunks.length} final chunks`);
+
+  return finalChunks;
+}
+
+// ─── Main Text Chunking + Insertion ─────────────────────────────────────────
 
 async function chunkAndInsertText(text: string, fileName: string, folder?: string | null): Promise<{ indexed: number; textChunks: number }> {
   let indexed = 0;
   let textChunks = 0;
 
-  // Semantic chunking with overlap
-  const rawChunks: string[] = [];
-  const paragraphs = text.split(/\n\s*\n/);
-  let currentChunk = '';
-
-  for (const paragraph of paragraphs) {
-    if (currentChunk.length + paragraph.length > CHUNK_SIZE && currentChunk.length > 0) {
-      rawChunks.push(currentChunk.trim());
-      currentChunk = '';
-    }
-
-    if (paragraph.length > CHUNK_SIZE) {
-      const sentences = paragraph.match(/[^.!?]+[.!?]+/g) || [paragraph];
-      for (const sentence of sentences) {
-        if (currentChunk.length + sentence.length > CHUNK_SIZE && currentChunk.length > 0) {
-          rawChunks.push(currentChunk.trim());
-          currentChunk = '';
-        }
-        currentChunk += sentence + ' ';
-      }
-    } else {
-      currentChunk += paragraph + '\n\n';
-    }
-  }
-  if (currentChunk.trim()) {
-    rawChunks.push(currentChunk.trim());
-  }
-
-  // Apply sliding window overlap between adjacent chunks
-  const chunks: string[] = [];
-  for (let i = 0; i < rawChunks.length; i++) {
-    let chunk = rawChunks[i];
-    // Prepend tail of previous chunk as overlap context
-    if (i > 0) {
-      const prevTail = rawChunks[i - 1].slice(-CHUNK_OVERLAP);
-      chunk = prevTail + '\n' + chunk;
-    }
-    chunks.push(chunk);
-  }
-
-  console.log(`[${fileName}] Semantic chunking: ${rawChunks.length} base chunks with ${CHUNK_OVERLAP}-char overlap`);
+  // True semantic chunking: detect topic boundaries via embedding similarity
+  const chunks = await semanticChunkText(text, fileName);
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i].trim();
