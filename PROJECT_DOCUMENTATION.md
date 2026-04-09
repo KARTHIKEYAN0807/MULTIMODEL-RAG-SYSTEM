@@ -83,7 +83,7 @@ The **Local Multimodal RAG System** is a privacy-first, AI-powered document inte
 | Technology | Purpose |
 |------------|---------|
 | **Supabase** (Cloud PostgreSQL) | Primary database and storage platform |
-| **pgvector** extension | Vector similarity search (cosine distance) with HNSW indexing |
+| **pgvector** extension | Vector similarity search (cosine distance) with HNSW(Hierarchical Navigable Small World) indexing  |
 | **PostgreSQL tsvector** + GIN index | Full-text search (BM25-style keyword matching) |
 | **Supabase Storage** (S3-compatible) | Image file storage for uploaded and extracted images |
 
