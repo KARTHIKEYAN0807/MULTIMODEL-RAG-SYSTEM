@@ -1,496 +1,1222 @@
-# 🧠 Local Multimodal RAG System
+# 📘 Local Multimodal RAG System — Project Documentation
 
-> **An advanced, privacy-first Retrieval-Augmented Generation system** that runs entirely on your local machine. Upload PDFs and images, ask natural language questions, and get AI-powered answers grounded in your documents — with full source citations, vision AI analysis, and enterprise-grade retrieval techniques.
-
-![Next.js](https://img.shields.io/badge/Next.js-16.2-black?logo=next.js)
-![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript)
-![Ollama](https://img.shields.io/badge/Ollama-Local_LLM-white?logo=ollama)
-![Supabase](https://img.shields.io/badge/Supabase-pgvector-3ECF8E?logo=supabase)
-![License](https://img.shields.io/badge/License-MIT-green)
+> **Version:** 1.0  
+> **Last Updated:** April 2026  
+> **Author:** Project Team  
 
 ---
 
-## 📋 Table of Contents
+## Table of Contents
 
-- [Features](#-features)
-- [Architecture](#-architecture)
-- [Tech Stack](#-tech-stack)
-- [RAG Pipeline](#-rag-pipeline-deep-dive)
-- [Project Structure](#-project-structure)
-- [Getting Started](#-getting-started)
-- [RAGAS Evaluation](#-ragas-evaluation)
-- [API Reference](#-api-reference)
-- [Advanced Techniques Used](#-advanced-techniques-used)
-
----
-
-## ✨ Features
-
-| Feature | Description |
-|---------|-------------|
-| 📄 **PDF Ingestion** | Extracts text with semantic paragraph-aware chunking + 200-char sliding window overlap |
-| 🖼️ **Image Analysis** | Moondream vision AI extracts captions from uploaded images and embedded PDF images |
-| 💬 **Streaming Chat** | Real-time token-by-token streaming with buffered NDJSON parsing |
-| 🔍 **Multi-Query Fusion** | Generates 3 search perspectives per question, fuses results via Reciprocal Rank Fusion (RRF) |
-| 🔗 **Hybrid Search** | Combines pgvector cosine similarity (70%) + Postgres BM25 full-text search (30%) |
-| 🔄 **Query Reformulation** | Rewrites follow-up questions into standalone search queries using chat history context |
-| 📎 **Drag & Drop Vision** | Drop images directly into the chat to ask questions — routes to Moondream vision model |
-| 📑 **Source Citations** | Every AI response shows which source files were used (via `X-Sources` HTTP header) |
-| 🗂️ **File Management** | View, count, and delete indexed files with their chunk counts |
-| 📊 **RAGAS Evaluation** | Built-in LLM-as-a-Judge evaluation endpoint measuring Faithfulness, Relevancy, Precision, and Quality |
-| 🎨 **Premium UI** | Glassmorphism design with gradient accents, markdown rendering, syntax highlighting, and smooth animations |
+1. [Project Overview](#1-project-overview)
+2. [Tech Stack](#2-tech-stack)
+3. [Project Structure](#3-project-structure)
+4. [System Architecture](#4-system-architecture)
+5. [Data Flow — Document Ingestion Pipeline](#5-data-flow--document-ingestion-pipeline)
+6. [Data Flow — Query & Retrieval Pipeline](#6-data-flow--query--retrieval-pipeline)
+7. [Data Flow — Response Generation Pipeline](#7-data-flow--response-generation-pipeline)
+8. [Data Flow — Evaluation Pipeline (RAGAS)](#8-data-flow--evaluation-pipeline-ragas)
+9. [Database Schema](#9-database-schema)
+10. [AI Models Used](#10-ai-models-used)
+11. [Key Algorithms & Methods](#11-key-algorithms--methods)
+12. [API Reference](#12-api-reference)
+13. [Frontend Architecture](#13-frontend-architecture)
+14. [Deployment & DevOps](#14-deployment--devops)
+15. [Known Pitfalls & Architectural Decisions](#15-known-pitfalls--architectural-decisions)
 
 ---
 
-## 🏗️ Architecture
+## 1. Project Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         BROWSER (Next.js Client)                     │
-│  ┌──────────┐  ┌──────────┐  ┌─────────────┐  ┌───────────────┐   │
-│  │ ChatUI   │  │ Upload   │  │ FileManager │  │   Markdown    │   │
-│  │ (stream) │  │ (drag&   │  │ (CRUD)      │  │   Renderer    │   │
-│  │          │  │  drop)   │  │             │  │ (react-md)    │   │
-│  └────┬─────┘  └────┬─────┘  └──────┬──────┘  └───────────────┘   │
-│       │              │               │                               │
-└───────┼──────────────┼───────────────┼───────────────────────────────┘
-        │              │               │
-        ▼              ▼               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                      NEXT.JS API ROUTES (Server)                     │
-│                                                                      │
-│  POST /api/chat ──────────────────────────────────────────────────  │
-│  │                                                                │  │
-│  │  1. Input Validation                                           │  │
-│  │  2. Image Detection → [moondream bypass]                       │  │
-│  │  3. Query Reformulation (multi-turn context)                   │  │
-│  │  4. Multi-Query Generation (3 search perspectives)             │  │
-│  │  5. Hybrid Search (vector + keyword) × 3 queries               │  │
-│  │  6. Reciprocal Rank Fusion (merge & re-rank)                   │  │
-│  │  7. Context Assembly + Citation Extraction                     │  │
-│  │  8. LLM Streaming Response                                    │  │
-│  │                                                                │  │
-│  POST /api/upload ────────────────────────────────────────────────  │
-│  │  PDF: Semantic Chunking → Overlap → Embed → Store              │  │
-│  │  IMG: Moondream Caption → Embed → Store                        │  │
-│  │  PDF Images: JPEG Extraction → Moondream → Embed → Store      │  │
-│  │                                                                │  │
-│  GET/DELETE /api/files ───────────────────────────────────────────  │
-│  │  List unique sources, delete by filename                       │  │
-│  │                                                                │  │
-│  POST /api/evaluate ──────────────────────────────────────────────  │
-│  │  RAGAS-style LLM-as-Judge evaluation                           │  │
-│  │                                                                │  │
-└───────┬──────────────┬───────────────────────────────────────────────┘
-        │              │
-        ▼              ▼
-┌──────────────┐  ┌──────────────────────────────────────────────┐
-│   OLLAMA     │  │              SUPABASE (Cloud)                │
-│  (Local AI)  │  │                                              │
-│              │  │  ┌────────────────────────────────────────┐  │
-│  llama3.2    │  │  │          documents table               │  │
-│  (3B, Chat)  │  │  │  id | content | metadata | embedding  │  │
-│              │  │  │     | fts (tsvector)                   │  │
-│  nomic-embed │  │  │                                        │  │
-│  (Embedding) │  │  │  match_documents() — vector search     │  │
-│              │  │  │  hybrid_search() — vector + keyword    │  │
-│  moondream   │  │  └────────────────────────────────────────┘  │
-│  (Vision AI) │  │                                              │
-│              │  │  ┌────────────────────────────────────────┐  │
-└──────────────┘  │  │        images storage bucket           │  │
-                  │  └────────────────────────────────────────┘  │
-                  └──────────────────────────────────────────────┘
-```
+The **Local Multimodal RAG System** is a privacy-first, AI-powered document intelligence platform that runs entirely on your local machine. Users can upload PDFs, Word documents, plain text files, and images, then ask natural language questions and receive AI-generated answers grounded in their own documents.
+
+### Core Capabilities
+
+| Capability | Description |
+|------------|-------------|
+| **Document Ingestion** | Accepts PDFs, DOCX, TXT, MD, CSV, images (PNG/JPG/WEBP), and web URLs |
+| **Multimodal Analysis** | Vision AI (Moondream) analyzes uploaded images and embedded PDF images |
+| **Intelligent Retrieval** | Multi-Query Fusion + Hybrid Search (vector + keyword) + Reciprocal Rank Fusion |
+| **Streaming Chat** | Real-time token-by-token response via NDJSON stream buffering |
+| **Source Citations** | Every AI response includes which source files were used |
+| **RAGAS Evaluation** | Built-in LLM-as-a-Judge scoring for Faithfulness, Relevancy, Precision, Recall, and Similarity |
+| **File Management** | CRUD operations for indexed documents (list, count, delete by file or folder) |
+| **Privacy** | All AI inference runs locally via Ollama — no data leaves your machine |
 
 ---
 
-## 🛠️ Tech Stack
+## 2. Tech Stack
 
-| Layer | Technology | Purpose |
-|-------|-----------|---------|
-| **Frontend** | Next.js 16.2 (Turbopack) | React server/client framework |
-| **Styling** | Tailwind CSS 4 | Utility-first styling with glassmorphism design system |
-| **Markdown** | react-markdown + remark-gfm + rehype-highlight | Renders AI responses with tables, code highlighting |
-| **LLM (Text)** | Ollama — `llama3.2` (3B params) | Local text generation and query reformulation |
-| **LLM (Vision)** | Ollama — `moondream` | Local image captioning and visual Q&A |
-| **Embeddings** | Ollama — `nomic-embed-text` (768-dim) | Local vector embedding generation |
-| **Vector DB** | Supabase + pgvector | Cosine similarity search on 768-dim vectors |
-| **Full-Text Search** | Postgres tsvector + GIN index | BM25-style keyword matching |
-| **Storage** | Supabase Storage | Image file storage for uploaded/extracted images |
-| **Language** | TypeScript 5 | End-to-end type safety |
+### 2.1 Frontend
 
----
+| Technology | Version | Purpose |
+|------------|---------|---------|
+| **Next.js** | 16.2 (Turbopack) | Full-stack React framework (server + client) |
+| **React** | 19.2 | UI component library |
+| **TypeScript** | 5.x | End-to-end type safety |
+| **Tailwind CSS** | 4.x | Utility-first styling with custom glassmorphism design system |
+| **react-markdown** | 10.1 | Renders AI responses as rich Markdown (tables, lists, headings) |
+| **remark-gfm** | 4.0 | GitHub Flavored Markdown support (tables, strikethrough, task lists) |
+| **rehype-highlight** | 7.0 | Syntax highlighting for code blocks in AI responses |
+| **highlight.js** | 11.11 | Underlying syntax highlighting engine |
+| **Inter** (Google Font) | — | Primary typeface |
 
-## 🔬 RAG Pipeline Deep Dive
+### 2.2 Backend (API Routes)
 
-### 1. Document Ingestion (`/api/upload`)
+| Technology | Purpose |
+|------------|---------|
+| **Next.js API Routes** | RESTful API endpoints (no separate server) |
+| **pdf-parse** | Extract text content from PDF files |
+| **mammoth** | Extract text content from DOCX (Word) files |
+| **cheerio** | HTML parsing for web URL scraping |
 
-```
-PDF Upload
-    │
-    ├── Text Extraction (pdf-parse)
-    │       │
-    │       ├── Semantic Chunking
-    │       │    Split by paragraphs (\\n\\n), then sentences
-    │       │    Target size: 1000 chars per chunk
-    │       │
-    │       ├── Sliding Window Overlap
-    │       │    200-char overlap between adjacent chunks
-    │       │    Prevents context loss at boundaries
-    │       │
-    │       └── Embedding + Storage
-    │            nomic-embed-text → 768-dim vector → Supabase
-    │
-    └── JPEG Image Extraction
-            │
-            ├── Binary marker scan (FFD8→FFD9)
-            ├── Moondream vision captioning
-            └── Caption → Embed → Store
-```
+### 2.3 AI / Machine Learning (Local via Ollama)
 
-### 2. Query Processing (`/api/chat`)
+| Model | Type | Dimensions | Purpose |
+|-------|------|-----------|---------|
+| **llama3.2** (3B params) | Text LLM | — | Chat generation, query reformulation, multi-query generation, RAGAS judging |
+| **mxbai-embed-large** | Embedding | 1024-dim | Vector embedding generation for document chunks and search queries |
+| **moondream** | Vision LLM | — | Image captioning, visual Q&A, analyzing uploaded/extracted images |
 
-```
-User Question: "How does the funding evaluation work?"
-    │
-    ├── [A] Image attached? → Route to Moondream (bypass RAG)
-    │
-    ├── [B] Multi-turn? → Query Reformulation
-    │       "Tell me more" → "Detailed explanation of startup funding evaluation criteria"
-    │
-    ├── [C] Multi-Query Generation (3 perspectives)
-    │       Query 1: "startup funding evaluation process"
-    │       Query 2: "criteria for evaluating startup investments"
-    │       Query 3: "scoring rubric for venture applications"
-    │
-    ├── [D] Hybrid Search × 3 queries
-    │       Each query runs:
-    │         • pgvector cosine similarity (weight: 0.7)
-    │         • Postgres BM25 full-text search (weight: 0.3)
-    │
-    ├── [E] Reciprocal Rank Fusion
-    │       Score = Σ 1/(k + rank) across all result sets
-    │       Merge, deduplicate, select top 6
-    │
-    ├── [F] Context Assembly + System Prompt
-    │       Inject top-6 chunks into LLM context window
-    │
-    └── [G] Streaming Response
-            llama3.2 → NDJSON buffer → text stream → browser
-            + X-Sources header with Base64-encoded citations
-```
+### 2.4 Database & Storage
 
-### 3. Advanced Retrieval Techniques
+| Technology | Purpose |
+|------------|---------|
+| **Supabase** (Cloud PostgreSQL) | Primary database and storage platform |
+| **pgvector** extension | Vector similarity search (cosine distance) with HNSW indexing |
+| **PostgreSQL tsvector** + GIN index | Full-text search (BM25-style keyword matching) |
+| **Supabase Storage** (S3-compatible) | Image file storage for uploaded and extracted images |
 
-| Technique | What it does | Why it matters |
-|-----------|-------------|----------------|
-| **Semantic Chunking** | Splits by paragraphs & sentences instead of character count | Preserves meaning boundaries |
-| **Chunk Overlap** | 200-char sliding window between adjacent chunks | Prevents boundary context loss |
-| **Query Reformulation** | Rewrites vague follow-ups into explicit standalone queries | Fixes "what is *it*?" problems |
-| **Multi-Query Generation** | Creates 3 search angles per question | Improves recall on complex queries |
-| **Reciprocal Rank Fusion** | Mathematically merges results from multiple searches | Same algorithm used by Elasticsearch |
-| **Hybrid Search** | Combines vector (semantic) + keyword (exact match) search | Catches both meaning and exact terms |
-| **NDJSON Stream Buffering** | Accumulates partial JSON across TCP chunks | Prevents dropped words in streaming |
+### 2.5 DevOps
+
+| Technology | Purpose |
+|------------|---------|
+| **Docker** | Containerized production deployment |
+| **Node.js 20** (Alpine) | Runtime environment |
 
 ---
 
-## 🐛 Common RAG Pitfalls & Solutions (Architecture Notes)
-
-This system was refined by solving several complex pipeline issues. These notes serve as a reference for why certain architectural decisions were made:
-
-### 1. The "Multi-Query Hallucination" Problem
-* **Symptom:** Queries about specific, structured topics (e.g., `"STAGE 3 in power electronics scoring logic"`) returned generic, useless results.
-* **Root Cause:** The multi-query text generator was rewriting the prompt into broad synonyms (e.g., `"Control Techniques for Power Quality"`), completely missing the specific document terms.
-* **Solution (Query Bypass Heuristic):** We implemented a **Smart Bypass**. If a query is ≤ 2 words, OR contains structured keywords (`stage N`, `scoring logic`, `marks`, `criteria`), we completely skip the LLM multi-query step and only use the original query to preserve exact-match targeting.
-
-### 2. The "Header vs. Table" Chunking Disconnect
-* **Symptom:** The AI would find a section header like "STAGE 3", but claim there was no scoring criteria listed under it.
-* **Root Cause:** The semantic chunking limit split the document right after the "STAGE 3" header. The next chunk contained the scoring table, but lacked the words "STAGE 3". Vector semantic search couldn't link them natively.
-* **Solution (Two-Pass Keyword Pinning):** We implemented a deterministic override before vector search:
-  1. **Pass 1:** Do a direct Postgres `ILIKE` search for the explicit stage mention (e.g. `%stage 3%`) to grab the header.
-  2. **Pass 2:** Do another `ILIKE` search for common scoring keywords (`marks`, `tools`, `sliders`) to grab adjacent tables.
-  3. We **pin these chunks** at the absolute top of the LLM context, guaranteeing high-precision retrieval regardless of cosine similarity.
-
-### 3. Pipeline Latency Bottlenecks (The ~20s wait)
-* **Symptom:** Chat took 18-20+ seconds to respond.
-* **Root Cause:** Two bottlenecks: the multi-query LLM call blocked retriever execution, and sending 15 full chunks (~15,000+ chars) caused slow final text generation.
-* **Solution:**
-  - Placed an **8-second `AbortController` timeout** on the multi-query LLM call. If it hangs, it falls back to the original query.
-  - Implemented a **6000 character hard-cap** on the assembled context string.
-  - Result: End-to-end latency dropped to **~6-9 seconds**.
-
-### 4. Zero-Latency RAGAS Auditing
-* **Symptom:** Evaluating grounding/relevancy on every chat added an extra 8-10 seconds post-response because it required two additional `llama3.2` LLM calls.
-* **Root Cause:** LLM-as-a-judge is robust but too slow for real-time streaming audits.
-* **Solution:** Replaced the terminal auto-audit LLM calls with a **Rule-Based N-Gram overlap check**.
-  - **Faithfulness:** Uses pure Bigram (n=2) intersection between the generated answer and retrieved context.
-  - **Relevancy:** Checks ratio of original query keywords appearing in the answer.
-  - Result: 0ms latency overhead, highly deterministic `✅ PASS` / `❌ FAIL` logs in terminal.
-
----
-
-## 📂 Project Structure
+## 3. Project Structure
 
 ```
 multimodal-rag/
-├── app/
-│   ├── api/
+│
+├── app/                                    # Next.js App Router
+│   ├── api/                                # ──── SERVER-SIDE API ROUTES ────
 │   │   ├── chat/
-│   │   │   └── route.ts          # Main RAG chat endpoint (streaming)
-│   │   │                          #   - Query reformulation
-│   │   │                          #   - Multi-query generation
-│   │   │                          #   - Hybrid search + RRF
-│   │   │                          #   - Image routing (moondream)
-│   │   │                          #   - Citation extraction
+│   │   │   └── route.ts                    # Main RAG chat endpoint (597 lines)
+│   │   │                                   #   - Input validation
+│   │   │                                   #   - Image detection → Moondream bypass
+│   │   │                                   #   - Multi-query generation
+│   │   │                                   #   - Hybrid search (vector + keyword)
+│   │   │                                   #   - Reciprocal Rank Fusion (RRF)
+│   │   │                                   #   - Keyword pinning (stage detection)
+│   │   │                                   #   - Context assembly (6000 char limit)
+│   │   │                                   #   - LLM streaming response
+│   │   │                                   #   - Rule-based RAGAS auto-audit
+│   │   │
 │   │   ├── upload/
-│   │   │   └── route.ts          # Document ingestion endpoint
-│   │   │                          #   - PDF text extraction
-│   │   │                          #   - Semantic chunking + overlap
-│   │   │                          #   - JPEG image extraction
-│   │   │                          #   - Moondream captioning
-│   │   │                          #   - nomic-embed-text embedding
+│   │   │   └── route.ts                    # Document ingestion endpoint (386 lines)
+│   │   │                                   #   - PDF text extraction (pdf-parse)
+│   │   │                                   #   - DOCX text extraction (mammoth)
+│   │   │                                   #   - Plain text / CSV / Markdown
+│   │   │                                   #   - Image upload + Moondream captioning
+│   │   │                                   #   - PDF embedded JPEG extraction
+│   │   │                                   #   - URL web scraping (cheerio)
+│   │   │                                   #   - Semantic chunking + overlap
+│   │   │                                   #   - Embedding + Supabase insert
+│   │   │
 │   │   ├── files/
-│   │   │   └── route.ts          # File management (GET list, DELETE)
-│   │   └── evaluate/
-│   │       └── route.ts          # RAGAS evaluation endpoint
-│   │                              #   - Faithfulness scoring
-│   │                              #   - Answer relevancy scoring
-│   │                              #   - Context precision scoring
-│   │                              #   - Response quality scoring
-│   ├── globals.css                # Design system (glassmorphism, animations)
-│   ├── layout.tsx                 # Root layout (Inter font, SEO, mesh gradient)
-│   └── page.tsx                   # Main page (sidebar + chat grid)
+│   │   │   └── route.ts                    # File management (154 lines)
+│   │   │                                   #   - GET: list files with chunk counts
+│   │   │                                   #   - DELETE: remove by source or folder
+│   │   │                                   #   - Storage cleanup for images
+│   │   │
+│   │   ├── evaluate/
+│   │   │   └── route.ts                    # RAGAS evaluation (434 lines)
+│   │   │                                   #   - Synthetic test case generation
+│   │   │                                   #   - 5-metric LLM-as-Judge scoring
+│   │   │                                   #   - Weighted score aggregation
+│   │   │
+│   │   └── rag/
+│   │       └── retrieve/
+│   │           └── route.ts                # Headless RAG retrieval API (67 lines)
+│   │                                       #   - JSON-only retrieval (no LLM generation)
+│   │                                       #   - For external LLM integrations
+│   │
+│   ├── globals.css                         # Design system (glassmorphism, animations)
+│   ├── layout.tsx                          # Root layout (Inter font, SEO meta, mesh gradient)
+│   └── page.tsx                            # Main page (sidebar + chat grid layout)
 │
-├── components/
-│   ├── ChatUI.tsx                 # Chat interface
-│   │                              #   - Markdown rendering (react-markdown)
-│   │                              #   - Drag & drop image upload
-│   │                              #   - Citation badges
-│   │                              #   - Streaming response display
-│   ├── UploadFile.tsx             # File upload with drag & drop zone
-│   └── FileManager.tsx            # Indexed files list with delete
+├── components/                             # ──── CLIENT-SIDE REACT COMPONENTS ────
+│   ├── ChatUI.tsx                          # Chat interface (336 lines)
+│   │                                       #   - Message list with Markdown rendering
+│   │                                       #   - Drag & drop image attachment
+│   │                                       #   - Streaming response display
+│   │                                       #   - Citation badges
+│   │                                       #   - LocalStorage session persistence
+│   │
+│   ├── UploadFile.tsx                      # File upload panel (with drag & drop zone)
+│   │
+│   └── FileManager.tsx                     # Indexed files list with delete (CRUD)
 │
-├── supabase/
+├── lib/                                    # ──── SHARED LIBRARIES ────
+│   ├── rag-engine.ts                       # Reusable RAG retrieval engine (182 lines)
+│   │                                       #   - getOllamaEmbedding()
+│   │                                       #   - generateMultiQueries()
+│   │                                       #   - reciprocalRankFusion()
+│   │                                       #   - performFullRetrieval()
+│   │
+│   └── rag-client-example.ts              # Example usage of RAG engine
+│
+├── supabase/                               # ──── DATABASE ────
 │   └── migrations/
-│       ├── 20260402095253_init_schema.sql    # Base schema (documents, pgvector)
-│       └── 20260407_hybrid_search.sql        # Hybrid search (fts, GIN index, RPC)
+│       └── 20260408_full_schema.sql        # Consolidated schema:
+│                                           #   - documents table (pgvector 1024-dim)
+│                                           #   - HNSW vector index
+│                                           #   - GIN full-text index
+│                                           #   - FTS trigger (auto tsvector)
+│                                           #   - hybrid_search() RPC function
 │
-├── .env.local                     # Supabase credentials
-├── package.json                   # Dependencies
-├── tsconfig.json                  # TypeScript config
-└── next.config.ts                 # Next.js config
+├── public/                                 # Static assets
+├── Dockerfile                              # Multi-stage Docker build
+├── .env.local                              # Environment variables (Supabase keys, Ollama URL)
+├── package.json                            # Dependencies & scripts
+├── tsconfig.json                           # TypeScript configuration
+├── next.config.ts                          # Next.js configuration
+└── .gitignore                              # Git ignore rules
 ```
 
 ---
 
-## 🚀 Getting Started
+## 4. System Architecture
 
-### Prerequisites
-
-- **Node.js** ≥ 18
-- **Ollama** installed and running ([Download](https://ollama.com))
-- **Supabase** project (cloud or local)
-
-### 1. Install dependencies
-
-```bash
-npm install
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       BROWSER (Next.js Client)                          │
+│                                                                         │
+│  ┌───────────┐   ┌────────────┐   ┌──────────────┐   ┌──────────────┐ │
+│  │  ChatUI    │   │ UploadFile │   │ FileManager  │   │  Markdown    │ │
+│  │ (stream +  │   │ (drag &    │   │ (CRUD list   │   │  Renderer    │ │
+│  │  d&d image │   │  drop +    │   │  + delete)   │   │ (react-md +  │ │
+│  │  attach)   │   │  folder)   │   │              │   │  highlight)  │ │
+│  └─────┬──────┘   └─────┬──────┘   └──────┬───────┘   └──────────────┘ │
+│        │                │                  │                             │
+└────────┼────────────────┼──────────────────┼─────────────────────────────┘
+         │                │                  │
+         ▼                ▼                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     NEXT.JS API ROUTES (Server)                         │
+│                                                                         │
+│  POST /api/chat ──────────────────────────────────────────────────────  │
+│  │  1. Input Validation                                               │ │
+│  │  2. Image Detection → [moondream vision bypass]                    │ │
+│  │  3. Multi-Query Generation (3 search perspectives)                 │ │
+│  │  4. Hybrid Search (vector 65% + keyword 35%) × 3 queries           │ │
+│  │  5. Reciprocal Rank Fusion (merge & re-rank)                       │ │
+│  │  6. Keyword Pinning (stage-specific content)                       │ │
+│  │  7. Context Assembly (6000 char cap) + Citation Extraction         │ │
+│  │  8. LLM Streaming Response (NDJSON buffered)                       │ │
+│  │  9. Background Rule-Based RAGAS Audit                              │ │
+│  │                                                                    │ │
+│  POST /api/upload ───────────────────────────────────────────────────  │
+│  │  Route 0: URL → fetch + cheerio → chunk → embed → store           │ │
+│  │  Route 1: Image → Supabase Storage + Moondream → embed → store    │ │
+│  │  Route 2: PDF → text + JPEG extraction → chunk/caption → embed    │ │
+│  │  Route 3: DOCX → mammoth text → chunk → embed → store             │ │
+│  │  Route 4: TXT/MD/CSV → chunk → embed → store                      │ │
+│  │                                                                    │ │
+│  GET/DELETE /api/files ──────────────────────────────────────────────  │
+│  │  List unique sources → group by filename → return chunk counts     │ │
+│  │  Delete by source OR folder → cleanup storage images               │ │
+│  │                                                                    │ │
+│  POST /api/evaluate ─────────────────────────────────────────────────  │
+│  │  Synthetic test generation → Full RAG pipeline → LLM-as-Judge      │ │
+│  │                                                                    │ │
+│  POST /api/rag/retrieve ─────────────────────────────────────────────  │
+│  │  Headless retrieval (JSON only, no LLM generation)                 │ │
+│                                                                         │
+└────────┬────────────────┬────────────────────────────────────────────────┘
+         │                │
+         ▼                ▼
+┌────────────────┐   ┌─────────────────────────────────────────────┐
+│    OLLAMA      │   │            SUPABASE (Cloud)                 │
+│  (Local AI)    │   │                                             │
+│                │   │  ┌───────────────────────────────────────┐  │
+│  llama3.2      │   │  │         documents table               │  │
+│  (3B, Chat +   │   │  │  id         uuid (PK)                 │  │
+│   Judge)       │   │  │  content    text                      │  │
+│                │   │  │  embedding  vector(1024) — HNSW index │  │
+│  mxbai-embed   │   │  │  metadata   jsonb                     │  │
+│  -large        │   │  │  fts        tsvector — GIN index      │  │
+│  (1024-dim     │   │  │  created_at timestamptz               │  │
+│   Embeddings)  │   │  │                                       │  │
+│                │   │  │  hybrid_search() — RPC function        │  │
+│  moondream     │   │  └───────────────────────────────────────┘  │
+│  (Vision AI)   │   │                                             │
+│                │   │  ┌───────────────────────────────────────┐  │
+└────────────────┘   │  │     images storage bucket             │  │
+                     │  │   (uploaded + extracted images)        │  │
+                     │  └───────────────────────────────────────┘  │
+                     └─────────────────────────────────────────────┘
 ```
 
-### 2. Pull required Ollama models
+---
 
-```bash
-ollama pull llama3.2          # 3B text generation model
-ollama pull nomic-embed-text  # 768-dim embedding model
-ollama pull moondream          # Vision AI model
+## 5. Data Flow — Document Ingestion Pipeline
+
+**Endpoint:** `POST /api/upload`  
+**File:** `app/api/upload/route.ts`
+
+### 5.1 Flow Diagram
+
+```
+User uploads file/URL
+       │
+       ▼
+┌──────────────────┐
+│  Input Detection │
+│  (MIME type +    │
+│   extension)     │
+└──────┬───────────┘
+       │
+       ├─── URL → fetch HTML → cheerio clean → extract text
+       ├─── Image (PNG/JPG/WEBP) → Supabase Storage + Moondream caption
+       ├─── PDF → pdf-parse text + JPEG binary extraction
+       ├─── DOCX → mammoth text extraction
+       └─── TXT/MD/CSV → raw UTF-8 read
+              │
+              ▼
+┌──────────────────────────────────────────────────────┐
+│          SEMANTIC CHUNKING (for all text)             │
+│                                                       │
+│  1. Split by paragraphs (\n\n)                       │
+│  2. If paragraph > 500 chars → split by sentences    │
+│  3. Accumulate until chunk reaches ~500 char limit   │
+│  4. Apply 100-char sliding window overlap            │
+│     (prepend tail of previous chunk)                 │
+│                                                       │
+│  Config: CHUNK_SIZE = 500, CHUNK_OVERLAP = 100       │
+└──────────┬───────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────┐
+│          ENRICHMENT + EMBEDDING                       │
+│                                                       │
+│  1. Prepend source metadata tag:                     │
+│     "[Source: filename.pdf | Folder: uploads]"       │
+│                                                       │
+│  2. Generate 1024-dim vector embedding               │
+│     via mxbai-embed-large (Ollama)                   │
+│                                                       │
+│  3. Insert into Supabase `documents` table:          │
+│     { content, embedding, metadata:{source,type} }   │
+│                                                       │
+│  4. PostgreSQL trigger auto-generates tsvector (fts) │
+└──────────────────────────────────────────────────────┘
 ```
 
-### 3. Configure environment
+### 5.2 PDF Image Extraction Method
 
-Create `.env.local`:
+For PDFs containing embedded JPEG images, the system uses a **binary marker scan** approach:
+
+1. Scan the raw PDF `Buffer` byte-by-byte
+2. Detect JPEG start marker: `0xFF 0xD8`
+3. Scan forward until JPEG end marker: `0xFF 0xD9`
+4. Extract the sub-buffer between markers
+5. Filter out images smaller than 5KB (noise/icons)
+6. Send each image to **Moondream** for vision captioning
+7. Embed the caption and store alongside text chunks
+
+> **Why binary scan?** This avoids heavy PDF rendering libraries and works with zero native dependencies — pure JavaScript.
+
+### 5.3 Image Processing Flow
+
+```
+Image file received
+       │
+       ├── Upload original to Supabase Storage bucket ("images")
+       │     → generates public URL
+       │
+       ├── Convert to base64
+       │
+       ├── Send to Moondream via Ollama /api/generate
+       │     Prompt: "Analyze this image in detail. Describe everything
+       │              you see including text, diagrams, charts..."
+       │
+       ├── Receive text description from Moondream
+       │
+       ├── Enrich: "[Image File: photo.png]\n\n{description}"
+       │
+       ├── Generate embedding (mxbai-embed-large, 1024-dim)
+       │
+       └── Insert into documents table
+             metadata: { source, type:"image", imageUrl }
+```
+
+### 5.4 URL Scraping Flow
+
+```
+URL string received
+       │
+       ├── fetch(url) → get raw HTML
+       │
+       ├── cheerio.load(html)
+       │     → Remove: script, style, noscript, nav, footer,
+       │               header, aside, .ad, .advertisement
+       │
+       ├── Extract clean body text
+       │
+       ├── Collapse excessive whitespace
+       │
+       └── Feed into standard text chunking pipeline
+```
+
+---
+
+## 6. Data Flow — Query & Retrieval Pipeline
+
+**Endpoint:** `POST /api/chat`  
+**File:** `app/api/chat/route.ts`
+
+### 6.1 Complete Query Processing Flow
+
+```
+User sends message
+       │
+       ▼
+┌──── STEP 1: INPUT VALIDATION ────┐
+│  Validate messages array exists   │
+│  Extract latest message content   │
+└──────────┬───────────────────────┘
+           │
+           ▼
+┌──── STEP 2: IMAGE ROUTING ───────┐
+│  If message has `.image` field:   │
+│    → Route DIRECTLY to Moondream  │
+│    → Skip entire RAG pipeline     │
+│    → Stream vision response       │
+│    → Return (no retrieval)        │
+└──────────┬───────────────────────┘
+           │ (text-only path)
+           ▼
+┌──── STEP 3: MULTI-QUERY GENERATION ──────────────────────┐
+│                                                           │
+│  METHOD: Generate 3 different search perspectives         │
+│                                                           │
+│  Bypass Conditions (use original query only):             │
+│    • Query ≤ 2 words (too short)                         │
+│    • Query matches structured patterns:                   │
+│      "stage N", "scoring logic", "marks",                │
+│      "assessment criteria", "eligibility", etc.          │
+│                                                           │
+│  Generation:                                              │
+│    • Send to llama3.2 with system prompt:                │
+│      "Generate exactly 3 different search queries..."    │
+│    • 8-second AbortController timeout                    │
+│    • Fallback: use original query on timeout/failure     │
+│                                                           │
+│  Result: [original_query, alt_1, alt_2, alt_3]           │
+└──────────┬───────────────────────────────────────────────┘
+           │
+           ▼
+┌──── STEP 4: HYBRID SEARCH (per query) ───────────────────┐
+│                                                           │
+│  For EACH of the 3-4 queries, in parallel:               │
+│                                                           │
+│  a) Generate embedding via mxbai-embed-large             │
+│                                                           │
+│  b) Call Supabase RPC hybrid_search():                   │
+│     ┌─ VECTOR SEARCH (weight: 0.65) ───────────────┐    │
+│     │  • Cosine similarity: 1 - (embedding <=> q)   │    │
+│     │  • HNSW index for fast ANN search             │    │
+│     │  • Threshold: 0.005                           │    │
+│     └───────────────────────────────────────────────┘    │
+│     ┌─ KEYWORD SEARCH (weight: 0.35) ──────────────┐    │
+│     │  • PostgreSQL ts_rank_cd() scoring            │    │
+│     │  • websearch_to_tsquery() for phrase matching  │    │
+│     │  • GIN index on tsvector column               │    │
+│     └───────────────────────────────────────────────┘    │
+│     Results: UNION ALL of both, limit 15 per query       │
+│                                                           │
+│  c) Fallback: If hybrid_search fails → match_documents   │
+│     (vector-only cosine search)                          │
+│                                                           │
+└──────────┬───────────────────────────────────────────────┘
+           │
+           ▼
+┌──── STEP 5: RECIPROCAL RANK FUSION (RRF) ───────────────┐
+│                                                           │
+│  METHOD: Merge all result sets into a single ranking     │
+│                                                           │
+│  Algorithm:                                               │
+│    For each document across all result sets:             │
+│      score = Σ  1 / (k + rank + 1)                      │
+│    where k = 60 (smoothing constant)                     │
+│                                                           │
+│  Steps:                                                   │
+│    1. Iterate all result sets (3-4 queries × 15 docs)    │
+│    2. For each doc, accumulate RRF score by rank         │
+│    3. Deduplicate by document ID                         │
+│    4. Sort descending by accumulated score               │
+│    5. Select top 10 documents                            │
+│                                                           │
+│  Why RRF? Same algorithm used by Elasticsearch.          │
+│  Produces robust ranking even with different score       │
+│  distributions across search methods.                    │
+└──────────┬───────────────────────────────────────────────┘
+           │
+           ▼
+┌──── STEP 6: KEYWORD PINNING (Optional) ─────────────────┐
+│                                                           │
+│  METHOD: Two-pass deterministic override for structured  │
+│  queries (e.g., "Stage 3 scoring criteria")              │
+│                                                           │
+│  Triggered when: query contains "stage N" pattern        │
+│                                                           │
+│  Pass 1: Direct ILIKE search for stage label             │
+│    SELECT * FROM documents                               │
+│    WHERE content ILIKE '%stage 3%' LIMIT 6               │
+│                                                           │
+│  Pass 2: Search for adjacent scoring table keywords      │
+│    Keywords: tools, checkboxes, sliders, marks,          │
+│    subjects studied, scoring criteria, etc.              │
+│                                                           │
+│  Result: Pinned chunks placed at TOP of context window   │
+│  (guarantees high-precision retrieval for structured     │
+│  document sections that vector search may miss)          │
+└──────────┬───────────────────────────────────────────────┘
+           │
+           ▼
+┌──── STEP 7: IMAGE RETRIEVAL (Optional) ─────────────────┐
+│                                                           │
+│  If no image found in hybrid search results:             │
+│                                                           │
+│  a) Try metadata/content ILIKE match on query words      │
+│     WHERE metadata->>'type' = 'image'                    │
+│     AND (source ILIKE '%word%' OR content ILIKE '%word%')│
+│                                                           │
+│  b) Fallback: If user asked for "latest image"           │
+│     → Fetch most recent image by created_at DESC         │
+│                                                           │
+│  Pinned image context is prepended to context string     │
+└──────────┬───────────────────────────────────────────────┘
+           │
+           ▼
+┌──── STEP 8: CONTEXT ASSEMBLY ───────────────────────────┐
+│                                                           │
+│  Assembly order (highest precision first):               │
+│    1. Pinned keyword chunks (if any)                     │
+│    2. Pinned image context (if any)                      │
+│    3. Top-K vector/RRF results (deduped against pinned)  │
+│                                                           │
+│  Hard cap: 6000 characters                               │
+│    → Truncated with: "...[context truncated]"            │
+│                                                           │
+│  Citation extraction:                                     │
+│    → Collect all unique metadata.source values           │
+│    → Encode as Base64 JSON in X-Sources HTTP header      │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 6.2 Search Weight Configuration
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `vector_weight` | 0.65 | Weight for cosine similarity scores |
+| `text_weight` | 0.35 | Weight for BM25 full-text scores |
+| `match_count` | 15 | Max docs per search query |
+| `match_threshold` | 0.005 | Min similarity to include a result |
+| `RRF k` | 60 | Smoothing constant for Reciprocal Rank Fusion |
+| `top_k` | 10 | Final number of documents sent to LLM |
+| `CONTEXT_CHAR_LIMIT` | 6000 | Maximum characters in assembled context |
+
+---
+
+## 7. Data Flow — Response Generation Pipeline
+
+### 7.1 System Prompt Construction
+
+The system prompt is dynamically constructed based on whether context was found:
+
+**With context:**
+```
+You are a precise AI assistant that answers questions using ONLY the provided document context.
+
+RULES:
+1. Answer using ONLY information from the context below. Do NOT use outside knowledge.
+2. If the context contains scoring criteria, marks, or rubrics — quote them exactly.
+3. Structure your answer clearly: use bullet points or a table if the source uses them.
+4. Be concise and directly answer the user's question.
+5. In your answer, naturally use the key terms from the user's question.
+6. Ground every fact you state in the context — use exact words/numbers from the document.
+
+Context:
+{assembled context text}
+```
+
+**Without context:**
+```
+You are a precise AI assistant.
+No relevant document chunks were found matching this query.
+Respond with: "I do not have enough information based on the provided documents."
+Suggest the user upload or re-index the relevant document.
+```
+
+### 7.2 Streaming Architecture
+
+```
+Ollama /api/chat (stream: true)
+       │
+       ▼
+┌──────────────────────────────────────────────────────────┐
+│  NDJSON STREAM PROCESSING (ReadableStream API)           │
+│                                                           │
+│  1. Reader reads raw bytes from Ollama TCP connection    │
+│  2. Decoder converts bytes → UTF-8 text                  │
+│  3. Buffer accumulates partial JSON across TCP chunks    │
+│  4. Split buffer by newlines                             │
+│  5. Parse each complete line as JSON                     │
+│  6. Extract message.content token                        │
+│  7. Enqueue token to browser ReadableStream              │
+│  8. Accumulate full response for post-audit              │
+│                                                           │
+│  On stream end:                                          │
+│    → Flush remaining buffer                              │
+│    → Trigger background RAGAS audit                      │
+│    → Close controller                                    │
+└──────────────────────────────────────────────────────────┘
+       │
+       ▼
+Browser receives text/plain stream
+       │
+       ▼
+ChatUI reads chunks via ReadableStream reader
+       │
+       ▼
+React state updates → Markdown rendering → UI
+```
+
+### 7.3 LLM Configuration
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `model` | llama3.2 | Primary text generation model |
+| `num_ctx` | 4096 | Context window size (VRAM safety cap) |
+| `temperature` | 0.0 | Deterministic output (no randomness) |
+| `stream` | true | Token-by-token streaming |
+
+### 7.4 Citation Delivery
+
+Citations are passed to the browser via a custom HTTP header:
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+X-Sources: eyJmaWxlcy...(base64)
+
+[streaming text body]
+```
+
+The client decodes: `JSON.parse(atob(response.headers.get('X-Sources')))`  
+Result: `["document.pdf", "image.png"]`
+
+---
+
+## 8. Data Flow — Evaluation Pipeline (RAGAS)
+
+**Endpoint:** `POST /api/evaluate`  
+**File:** `app/api/evaluate/route.ts`
+
+### 8.1 RAGAS Evaluation Flow
+
+```
+POST /api/evaluate
+       │
+       ├── Option A: User provides { questions: [...] }
+       │
+       └── Option B: Auto-generate synthetic test cases
+           │
+           ├── Fetch random chunks from documents table
+           ├── Ask llama3.1 to generate Q&A pairs per chunk
+           └── Parse QUESTION: / ANSWER: format
+               │
+               ▼
+┌──── FOR EACH TEST QUESTION ──────────────────────────────┐
+│                                                           │
+│  Step 1: Query full RAG pipeline (/api/chat)             │
+│    → Capture: answer text, X-Sources header, latency     │
+│                                                           │
+│  Step 2: Run 5 LLM-as-Judge evaluations (parallel)      │
+│                                                           │
+│  ┌─ Faithfulness (25%) ─────────────────────────────┐    │
+│  │  "Is the answer grounded? No hallucinations?"     │    │
+│  │  Score: 1-5 via llama3.1                         │    │
+│  └──────────────────────────────────────────────────┘    │
+│                                                           │
+│  ┌─ Answer Relevancy (25%) ─────────────────────────┐    │
+│  │  "Does the answer directly address the question?" │    │
+│  │  Score: 1-5 via llama3.1                         │    │
+│  └──────────────────────────────────────────────────┘    │
+│                                                           │
+│  ┌─ Context Precision (15%) ────────────────────────┐    │
+│  │  "Were the retrieved source files relevant?"      │    │
+│  │  Score: 1-5 via llama3.1                         │    │
+│  └──────────────────────────────────────────────────┘    │
+│                                                           │
+│  ┌─ Context Recall (15%) ───────────────────────────┐    │
+│  │  "Does context contain info for ground truth?"    │    │
+│  │  Score: 1-5 via llama3.1                         │    │
+│  └──────────────────────────────────────────────────┘    │
+│                                                           │
+│  ┌─ Answer Similarity (20%) ────────────────────────┐    │
+│  │  "How close is AI answer to the golden answer?"   │    │
+│  │  Score: 1-5 via llama3.1                         │    │
+│  └──────────────────────────────────────────────────┘    │
+│                                                           │
+│  Step 3: Weighted aggregation                            │
+│    overall = F×0.25 + R×0.25 + CP×0.15 + CR×0.15       │
+│             + AS×0.20                                    │
+│                                                           │
+└──────────────────────────────────────────────────────────┘
+       │
+       ▼
+Return JSON: { totalQuestions, averageScores, results[], evaluatedAt }
+```
+
+### 8.2 Real-Time Auto-Audit (Rule-Based)
+
+In addition to the full RAGAS evaluation endpoint, every chat response triggers a **zero-latency rule-based audit** in the background:
+
+| Metric | Method | Algorithm |
+|--------|--------|-----------|
+| **Faithfulness** | Unigram content-word grounding | Tokenize answer → filter stop words → check what fraction of content words appear in the retrieved context. Score: >55% → 5/5, >40% → 4/5, etc. |
+| **Relevancy** | Question-type-aware satisfaction | 1) Detect question type (factual, explanatory, procedural, listing, yes/no). 2) Check if answer structure matches intent. 3) Compute key-term overlap with synonym normalization. 4) Combine both signals. |
+
+```
+Terminal Output:
+┌───────────────── AI SELF-AUDIT REPORT ─────────────────┐
+│ Question: How does the funding evaluation work?...      │
+│ Latency:  6.42s                                         │
+├─────────────────────────────────────────────────────────┤
+│ FAITHFULNESS (Grounding): [★★★★★] 5/5                  │
+│ ANSWER RELEVANCY:         [★★★★★] 5/5                  │
+├─────────────────────────────────────────────────────────┤
+│ STATUS:  [✅ PASS] Audit Complete                       │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 9. Database Schema
+
+**Migration File:** `supabase/migrations/20260408_full_schema.sql`
+
+### 9.1 Documents Table
+
+```sql
+CREATE TABLE public.documents (
+  id         uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  content    text NOT NULL,                    -- The actual text chunk or image caption
+  embedding  vector(1024) NOT NULL,            -- 1024-dim vector from mxbai-embed-large
+  metadata   jsonb DEFAULT '{}'::jsonb NOT NULL, -- Source info, type, folder, etc.
+  created_at timestamptz DEFAULT now() NOT NULL,
+  fts        tsvector                          -- Auto-populated by trigger
+);
+```
+
+### 9.2 Metadata JSONB Structure
+
+```json
+// For text chunks:
+{
+  "source": "document.pdf",
+  "type": "text",
+  "chunkIndex": 3,
+  "folder": "uploads"          // optional
+}
+
+// For images:
+{
+  "source": "photo.png",
+  "type": "image",
+  "imageUrl": "https://supabase.co/storage/v1/object/public/images/...",
+  "pageIndex": 0,              // for PDF-extracted images
+  "folder": "uploads"          // optional
+}
+```
+
+### 9.3 Indexes
+
+| Index | Type | Column | Parameters |
+|-------|------|--------|------------|
+| `documents_embedding_idx` | HNSW | `embedding` | `vector_cosine_ops`, m=16, ef_construction=64 |
+| `documents_fts_idx` | GIN | `fts` | Standard GIN for tsvector |
+
+### 9.4 Triggers
+
+```sql
+-- Auto-populate fts column on every INSERT/UPDATE
+CREATE TRIGGER documents_fts_update
+  BEFORE INSERT OR UPDATE ON public.documents
+  FOR EACH ROW EXECUTE FUNCTION documents_fts_trigger();
+
+-- Trigger function:
+NEW.fts := to_tsvector('english', NEW.content);
+```
+
+### 9.5 RPC Functions
+
+**`hybrid_search()`** — Core retrieval function called by the API:
+
+```sql
+hybrid_search(
+  query_text text,              -- User's search text
+  query_embedding vector(1024), -- Pre-computed embedding
+  match_count int DEFAULT 10,   -- Max results
+  vector_weight float DEFAULT 0.7,
+  text_weight float DEFAULT 0.3,
+  match_threshold float DEFAULT 0.1
+)
+```
+
+Returns `UNION ALL` of:
+- **Vector results:** Cosine similarity × vector_weight, filtered by threshold
+- **Keyword results:** `ts_rank_cd()` × text_weight, filtered by `@@` match
+
+---
+
+## 10. AI Models Used
+
+### 10.1 llama3.2 (3B Parameters)
+
+| Use Case | Endpoint | Configuration |
+|----------|----------|---------------|
+| Chat generation | `POST /api/chat` | `stream: true, num_ctx: 4096, temperature: 0.0` |
+| Multi-query generation | `POST /api/chat` | `stream: false, num_ctx: 2048` |
+| RAGAS Judge | `POST /api/evaluate` | `stream: false, num_ctx: 4096, temperature: 0.1` |
+| Synthetic data gen | `POST /api/evaluate` | `stream: false, num_ctx: 4096, temperature: 0.1` |
+
+### 10.2 mxbai-embed-large (1024 dimensions)
+
+| Use Case | Endpoint | Notes |
+|----------|----------|-------|
+| Document chunk embedding | `POST /api/upload` | Each chunk enriched with source metadata before embedding |
+| Search query embedding | `POST /api/chat` | Each multi-query variant is independently embedded |
+| Headless retrieval embedding | `POST /api/rag/retrieve` | Same pipeline as chat |
+
+### 10.3 moondream (Vision)
+
+| Use Case | Endpoint | Notes |
+|----------|----------|-------|
+| Uploaded image captioning | `POST /api/upload` | Full description prompt |
+| PDF embedded image analysis | `POST /api/upload` | Same prompt as uploaded images |
+| Direct vision Q&A | `POST /api/chat` | Routes to moondream when image attached to message |
+
+---
+
+## 11. Key Algorithms & Methods
+
+### 11.1 Semantic Chunking with Overlap
+
+```
+Method: Paragraph-aware → Sentence-aware → Sliding Window
+
+1. Split text by double newlines (paragraphs)
+2. If paragraph exceeds CHUNK_SIZE (500):
+   → Split by sentence boundaries ([.!?])
+   → Accumulate sentences until limit
+3. Otherwise accumulate paragraphs into chunks
+4. After all raw chunks created:
+   → Prepend last 100 chars of previous chunk (overlap)
+
+Why: Preserves semantic meaning at paragraph boundaries.
+The overlap prevents context loss when information spans
+two consecutive chunks.
+```
+
+### 11.2 Multi-Query Generation
+
+```
+Method: LLM-based query expansion with smart bypass
+
+1. Check bypass conditions:
+   - Short query (≤ 2 words) → use original only
+   - Structured patterns (stage N, scoring, marks) → use original only
+
+2. If no bypass:
+   - Ask llama3.2 to generate 3 variant queries
+   - Each from a different angle (synonyms, broader, specific)
+   - 8-second timeout via AbortController
+   - Result: [original, variant1, variant2, variant3]
+
+3. Fallback: On any failure → [original query only]
+```
+
+### 11.3 Hybrid Search
+
+```
+Method: Parallel vector + keyword search with configurable weights
+
+Vector Search (65% weight):
+  - Convert query to 1024-dim embedding
+  - Cosine similarity via pgvector HNSW index
+  - Score: (1 - cosine_distance) × 0.65
+
+Keyword Search (35% weight):
+  - PostgreSQL websearch_to_tsquery()
+  - ts_rank_cd() scoring on GIN-indexed tsvector
+  - Score: ts_rank × 0.35
+
+Both run within a single SQL RPC call (UNION ALL)
+```
+
+### 11.4 Reciprocal Rank Fusion (RRF)
+
+```
+Method: Score-agnostic rank fusion across multiple result sets
+
+Algorithm:
+  For each document appearing in any result set:
+    RRF_score = Σ  1 / (k + rank_i + 1)
+  
+  where:
+    k = 60 (smoothing constant)
+    rank_i = position in result set i (0-indexed)
+    Sum over all result sets containing this document
+
+Properties:
+  - Score-distribution agnostic (only uses rank positions)
+  - Documents appearing in multiple searches get boosted
+  - Same algorithm used in Elasticsearch and RankFusion
+```
+
+### 11.5 NDJSON Stream Buffering
+
+```
+Method: Buffer accumulation for TCP chunk boundary handling
+
+Problem: Ollama streams as Newline-Delimited JSON (NDJSON).
+TCP may split a JSON object across multiple chunks.
+
+Solution:
+  1. Maintain a string buffer across read() calls
+  2. Append decoded bytes to buffer
+  3. Split buffer by newlines
+  4. Keep last element (potentially incomplete) as new buffer
+  5. Parse all complete lines as JSON
+  6. Extract message.content tokens
+  7. Enqueue to browser ReadableStream
+
+Result: Zero dropped tokens during streaming.
+```
+
+### 11.6 Keyword Pinning (Two-Pass Retrieval)
+
+```
+Method: Deterministic content override for structured documents
+
+Trigger: Query contains "stage N" pattern
+
+Pass 1 — Header chunks:
+  SELECT FROM documents WHERE content ILIKE '%stage 3%'
+  
+Pass 2 — Adjacent scoring table chunks:
+  SELECT FROM documents WHERE content ILIKE ANY OF:
+    '%tools%', '%checkboxes%', '%sliders%', '%marks%',
+    '%scoring criteria%', '%subjects studied%', etc.
+
+Pinned chunks are placed at the absolute top of LLM context,
+above all vector/RRF results. This guarantees retrieval of
+structured content that may score low on cosine similarity.
+```
+
+### 11.7 Rule-Based RAGAS Audit
+
+```
+Method: Zero-latency faithfulness + relevancy check (no LLM needed)
+
+Faithfulness:
+  - Tokenize answer → remove stop words → keep content words + numbers
+  - Check: what fraction of answer's content words appear in context?
+  - Thresholds: >55% → 5/5, >40% → 4/5, >25% → 3/5, >10% → 2/5
+
+Relevancy:
+  - Detect question type (factual, explanatory, procedural, listing, yes/no)
+  - Check structural satisfaction (e.g., factual → contains numbers)
+  - Compute key-term overlap with synonym normalization
+  - Combine: both satisfied + high term overlap → 5/5
+```
+
+---
+
+## 12. API Reference
+
+### 12.1 `POST /api/chat` — RAG Chat
+
+**Purpose:** Send a message and receive a streaming AI response grounded in indexed documents.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `messages` | `Array<{role, content, image?}>` | ✅ | Chat messages array |
+| `messages[].role` | `"user"` or `"assistant"` | ✅ | Message sender |
+| `messages[].content` | `string` | ✅ | Message text |
+| `messages[].image` | `string (base64)` | ❌ | Attached image (routes to Moondream) |
+
+**Response:**
+- **Body:** `text/plain` stream (token-by-token text)
+- **Header:** `X-Sources` — Base64-encoded JSON array of source filenames
+
+---
+
+### 12.2 `POST /api/upload` — Document Ingestion
+
+**Purpose:** Upload a file or URL for processing and indexing.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `file` | `File (multipart/form-data)` | PDF, DOCX, TXT, MD, CSV, PNG, JPG, WEBP |
+| `url` | `string` | URL to scrape (alternative to file) |
+| `folder` | `string` | Optional folder tag for batch organization |
+
+**Supported file types:**
+| Type | Processing |
+|------|-----------|
+| PDF | Text extraction + embedded JPEG extraction + Moondream captioning |
+| DOCX | Mammoth text extraction |
+| TXT / MD / CSV | Raw UTF-8 read |
+| Images | Supabase Storage upload + Moondream caption + embedding |
+| URLs | Cheerio HTML scraping + text extraction |
+
+**Response:**
+```json
+{
+  "success": true,
+  "chunksCount": 12,
+  "summary": "Processed 10 text chunks and 2 images."
+}
+```
+
+---
+
+### 12.3 `GET /api/files` — List Indexed Files
+
+**Purpose:** List all unique uploaded files with their chunk counts.
+
+**Response:**
+```json
+{
+  "files": [
+    {
+      "source": "document.pdf",
+      "type": "text",
+      "folder": null,
+      "chunkCount": 15,
+      "imageCount": 2
+    }
+  ]
+}
+```
+
+---
+
+### 12.4 `DELETE /api/files` — Delete Indexed File
+
+**Purpose:** Delete all chunks and images for a specific file or folder.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | `string` | Filename to delete |
+| `folder` | `string` | Folder name to delete (alternative) |
+
+**Response:**
+```json
+{
+  "success": true,
+  "deletedChunks": 15,
+  "deletedImages": 2,
+  "deletedTarget": "file: document.pdf"
+}
+```
+
+---
+
+### 12.5 `POST /api/evaluate` — RAGAS Evaluation
+
+**Purpose:** Run comprehensive RAG pipeline evaluation.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `questions` | `string[]` or `{question, groundTruth}[]` | Test questions (optional — auto-generates if omitted) |
+| `count` | `number` | Number of synthetic test cases (default: 5) |
+
+**Response:**
+```json
+{
+  "totalQuestions": 5,
+  "averageScores": {
+    "faithfulness": 4.2,
+    "answerRelevancy": 4.0,
+    "contextPrecision": 3.8,
+    "contextRecall": 4.0,
+    "answerSimilarity": 3.6,
+    "overall": 3.95
+  },
+  "averageLatencyMs": 8500,
+  "results": [ ... ],
+  "evaluatedAt": "2026-04-09T..."
+}
+```
+
+---
+
+### 12.6 `POST /api/rag/retrieve` — Headless Retrieval
+
+**Purpose:** Retrieve context without LLM generation. For external LLM integrations.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `query` | `string` | ✅ | Search query |
+
+**Response:**
+```json
+{
+  "query": "original query",
+  "retrieval_stats": {
+    "duration_ms": 1200,
+    "multi_queries_used": ["query1", "query2", "query3"],
+    "docs_found": 10,
+    "has_image_context": false
+  },
+  "context": {
+    "text_chunks": [
+      { "content": "...", "source": "doc.pdf", "score": 0.032 }
+    ],
+    "image_analysis": null
+  },
+  "full_context_text": "..."
+}
+```
+
+---
+
+### 12.7 API Security
+
+All endpoints support optional API key authentication:
+
+- Set `RAG_API_KEY` in `.env.local`
+- Send: `Authorization: Bearer <your-key>` header
+- If `RAG_API_KEY` is not set, endpoints are open (no auth required)
+
+---
+
+## 13. Frontend Architecture
+
+### 13.1 Component Hierarchy
+
+```
+layout.tsx (Root)
+  ├── globals.css (Design system + mesh gradient)
+  └── page.tsx (Main page)
+        ├── Header (gradient title + subtitle)
+        ├── Sidebar (lg:col-span-4)
+        │     ├── "How it works" panel
+        │     ├── UploadFile.tsx (drag & drop upload)
+        │     └── FileManager.tsx (CRUD file list)
+        └── Chat Panel (lg:col-span-8)
+              └── ChatUI.tsx (streaming chat)
+```
+
+### 13.2 Design System
+
+| Element | Style |
+|---------|-------|
+| **Background** | Dark (#030712) with radial gradient mesh overlay |
+| **Panels** | Glassmorphism (`backdrop-filter: blur(16px)`) |
+| **Accents** | Indigo (#6366f1) → Purple (#8b5cf6) gradient |
+| **Animations** | fadeInUp, shimmer, pulseGlow |
+| **Scrollbar** | Custom indigo-tinted thin scrollbar |
+| **Typography** | Inter font, anti-aliased |
+
+### 13.3 Chat Session Persistence
+
+- Messages are saved to `localStorage` under key `rag_chat_session`
+- Loaded on component mount
+- Cleared on "New Chat" action
+- Handles quota exceeded errors gracefully
+
+---
+
+## 14. Deployment & DevOps
+
+### 14.1 Environment Variables
 
 ```env
 NEXT_PUBLIC_SUPABASE_URL="https://your-project.supabase.co"
 NEXT_PUBLIC_SUPABASE_ANON_KEY="your-anon-key"
 SUPABASE_SERVICE_ROLE_KEY="your-service-role-key"
-OLLAMA_URL="http://127.0.0.1:11434"   # Optional, defaults to this
+OLLAMA_URL="http://127.0.0.1:11434"
+RAG_API_KEY="optional-api-key"
 ```
 
-### 4. Run database migrations
+### 14.2 Docker Deployment
 
-Execute both SQL files in your Supabase Dashboard → SQL Editor:
+The project includes a multi-stage Dockerfile:
 
-1. `supabase/migrations/20260402095253_init_schema.sql` — Creates base schema
-2. `supabase/migrations/20260407_hybrid_search.sql` — Adds hybrid search
+```
+Stage 1: deps     → npm ci (install dependencies)
+Stage 2: builder  → npm run build (Next.js production build)
+Stage 3: runner   → Standalone server (minimal image)
+```
 
-### 5. Start development server
-
+**Commands:**
 ```bash
-npm run dev
+npm run docker:build    # Build image
+npm run docker:up       # Run container (port 3000)
+npm run docker:down     # Stop and remove container
 ```
 
-Open [http://localhost:3000](http://localhost:3000)
+> **Note:** Docker container uses `host.docker.internal` for Ollama access.
+
+### 14.3 Production Deployment Options
+
+| Component | Free Option |
+|-----------|-------------|
+| Next.js App | Vercel, Netlify, or Render (free tier) |
+| Supabase DB | Supabase Free Tier (sufficient for personal use) |
+| Ollama AI | Must run locally — expose via ngrok/Cloudflare Tunnel |
 
 ---
 
-## ☁️ Cloud Deployment & Free Hosting
+## 15. Known Pitfalls & Architectural Decisions
 
-You can host parts of this project for completely free, with important considerations for the AI engine:
+### 15.1 Multi-Query Hallucination Problem
 
-### 1. Frontend & API (Free)
-The Next.js application (UI, Chat Interface, API routes) can be seamlessly deployed on free platforms like **Vercel**, **Netlify**, or **Render**. 
+**Problem:** The LLM rewrites specific queries (e.g., "STAGE 3 scoring logic") into broad synonyms ("Control Techniques for Power Quality"), missing exact document terms.
 
-### 2. Vector Database (Free)
-The application is configured to use **Supabase**, which provides a generous Free Tier more than sufficient for storing vectors, metadata, and files for personal/small projects.
+**Solution:** Implemented bypass heuristic — if query is ≤ 2 words OR matches structured patterns (`stage N`, `scoring`, `marks`, etc.), skip multi-query entirely and use the original query for maximum precision.
 
-### 3. AI Models / Ollama (The Catch)
-Ollama runs the local LLMs (LLaMA 3, Moondream), which require significant memory and GPU power. **There are no mainstream "free" cloud providers that will run these heavy AI models 24/7.**
-- **The Hybrid Solution (Free):** Host the Next.js app on Vercel. Keep Ollama running on your local PC, and use a tool like **ngrok** or **Cloudflare Tunnels** to safely expose your local Ollama port (11434) to the internet. Then set `OLLAMA_URL` in your Vercel environment variables to point to your ngrok/Cloudflare tunnel URL.
-- **The Cloud API API Alternative:** If you don't want to rely on your local machine, you will need to modify the code (`lib/rag-engine.ts`) to call a free-tier cloud AI provider (like **Groq** for fast LLaMA models, or **Google Gemini API**) instead of `fetch(OLLAMA_URL)`.
+### 15.2 Header vs. Table Chunking Disconnect
 
----
+**Problem:** Semantic chunking splits a section header ("STAGE 3") from its adjacent scoring table into different chunks. Vector search finds the header but can't link the table.
 
-## 📊 RAGAS Evaluation
+**Solution:** Two-pass keyword pinning — directly search for the stage label via ILIKE, then search for scoring keywords (marks, tools, sliders) separately, and pin both at the top of the context window.
 
-This project includes a built-in **RAGAS-inspired evaluation system** using LLM-as-a-Judge methodology. It tests your RAG pipeline across 4 key metrics.
+### 15.3 Pipeline Latency (18-20s → 6-9s)
 
-### Metrics
+**Problem:** Multi-query LLM call blocked retrieval execution, and sending 15+ full chunks (~15,000 chars) caused slow generation.
 
-| Metric | Weight | Description |
-|--------|--------|-------------|
-| **Faithfulness** | 30% | Is the answer grounded in retrieved context (no hallucination)? |
-| **Answer Relevancy** | 30% | Does the answer directly address the user's question? |
-| **Context Precision** | 20% | Were the retrieved document chunks actually relevant? |
-| **Response Quality** | 20% | Overall coherence, detail, and helpfulness |
+**Solutions:**
+- 8-second `AbortController` timeout on multi-query generation
+- 6000 character hard-cap on assembled context
+- Drop to original query on multi-query timeout
 
-### Running an Evaluation
+### 15.4 Zero-Latency Auto-Audit
 
-```bash
-# Run with default test questions
-curl -X POST http://localhost:3000/api/evaluate
+**Problem:** Full LLM-as-Judge evaluation added 8-10 seconds per response.
 
-# Run with custom questions
-curl -X POST http://localhost:3000/api/evaluate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "questions": [
-      "What is the scoring criteria?",
-      "How are startups evaluated?",
-      "What are the funding requirements?"
-    ]
-  }'
-```
-
-### Response Format
-
-```json
-{
-  "totalQuestions": 3,
-  "averageScores": {
-    "faithfulness": 4.33,
-    "answerRelevancy": 4.00,
-    "contextPrecision": 3.67,
-    "responseQuality": 4.33,
-    "overall": 4.10
-  },
-  "averageLatencyMs": 8500,
-  "results": [
-    {
-      "question": "What is the scoring criteria?",
-      "answer": "Based on the context...",
-      "sources": ["document.pdf"],
-      "scores": { ... },
-      "reasoning": { ... },
-      "latencyMs": 7200
-    }
-  ],
-  "evaluatedAt": "2026-04-07T10:30:00.000Z"
-}
-```
-
-### How It Works
-
-```
-For each test question:
-    │
-    ├── 1. Send question to /api/chat (full RAG pipeline)
-    │      Captures: answer text, sources, latency
-    │
-    ├── 2. LLM-as-Judge Evaluation (4 parallel prompts)
-    │      Uses llama3.2 to grade each dimension 1-5
-    │
-    └── 3. Weighted aggregation into overall score
-```
+**Solution:** Replaced real-time LLM audit with rule-based N-gram overlap checks that execute in ~0ms with no additional LLM calls. Full RAGAS evaluation is still available as a separate endpoint for batch testing.
 
 ---
 
-## 📡 API Reference
-
-### `POST /api/chat`
-
-Send a message and receive a streaming AI response.
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `messages` | `Array<{role, content, image?}>` | ✅ | Chat messages array |
-| `messages[].image` | `string (base64)` | ❌ | Attached image for vision analysis |
-
-**Response:** `text/plain` stream + `X-Sources` header (Base64 JSON of source filenames)
-
-### `POST /api/upload`
-
-Upload a PDF or image for ingestion.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `file` | `File (multipart/form-data)` | PDF, PNG, JPG, or WEBP |
-
-### `GET /api/files`
-
-List all indexed files with chunk counts.
-
-### `DELETE /api/files`
-
-Delete all chunks for a source file. Body: `{ "source": "filename.pdf" }`
-
-### `POST /api/evaluate`
-
-Run RAGAS evaluation. Body: `{ "questions": ["..."] }` (optional)
-
----
-
-## 🧪 Advanced Techniques Used
-
-### Retrieval
-- ✅ Semantic paragraph + sentence-aware chunking
-- ✅ 200-character sliding window chunk overlap
-- ✅ Contextual query reformulation (multi-turn)
-- ✅ Multi-query generation (3 search perspectives)
-- ✅ Reciprocal Rank Fusion (RRF) for result merging
-- ✅ Hybrid search (pgvector cosine + Postgres BM25 full-text)
-- ✅ Configurable vector/keyword weight ratio (70/30)
-
-### Generation
-- ✅ Streaming NDJSON with buffer accumulation (prevents dropped tokens)
-- ✅ Context window management (`num_ctx` caps for VRAM safety)
-- ✅ Multi-model routing (llama3.2 for text, moondream for vision)
-- ✅ Graceful fallback (hybrid → vector-only if migration not applied)
-
-### Evaluation
-- ✅ RAGAS-inspired LLM-as-a-Judge evaluation
-- ✅ 4-metric scoring (Faithfulness, Relevancy, Precision, Quality)
-- ✅ Weighted aggregation with per-question reasoning
-
-### Frontend
-- ✅ Markdown rendering with syntax highlighting
-- ✅ Glassmorphism design system with gradient mesh background
-- ✅ Drag & drop image upload with preview
-- ✅ Source citation badges on AI responses
-- ✅ File management panel with CRUD operations
-- ✅ Smooth fade-in animations and micro-interactions
-
----
-
-## 📄 License
-
-MIT License. Built with ❤️ using local AI.
+> **End of Documentation**
