@@ -290,13 +290,15 @@ User uploads file/URL
 ┌──────────────────────────────────────────────────────┐
 │          SEMANTIC CHUNKING (for all text)             │
 │                                                       │
-│  1. Split by paragraphs (\n\n)                       │
-│  2. If paragraph > 500 chars → split by sentences    │
-│  3. Accumulate until chunk reaches ~500 char limit   │
-│  4. Apply 100-char sliding window overlap            │
-│     (prepend tail of previous chunk)                 │
+│  1. Split text into sentences                         │
+│  2. Embed sliding windows (3 sentences each)          │
+│     via mxbai-embed-large (1024-dim)                  │
+│  3. Compute cosine similarity between windows         │
+│  4. Adaptive breakpoint: break where similarity <     │
+│     (mean − 1× stddev) → topic shift detected        │
+│  5. Enforce MAX_CHUNK_SIZE = 800, MIN = 100 chars     │
 │                                                       │
-│  Config: CHUNK_SIZE = 500, CHUNK_OVERLAP = 100       │
+│  Config: SENTENCE_WINDOW = 3, BREAKPOINT_STDDEV = 1.0 │
 └──────────┬───────────────────────────────────────────┘
            │
            ▼
@@ -817,22 +819,49 @@ Returns `UNION ALL` of:
 
 ## 11. Key Algorithms & Methods
 
-### 11.1 Semantic Chunking with Overlap
+### 11.1 Semantic Chunking (Embedding-Based Breakpoint Detection)
 
 ```
-Method: Paragraph-aware → Sentence-aware → Sliding Window
+Method: Sliding-window sentence embedding → cosine similarity → adaptive breakpoints
 
-1. Split text by double newlines (paragraphs)
-2. If paragraph exceeds CHUNK_SIZE (500):
-   → Split by sentence boundaries ([.!?])
-   → Accumulate sentences until limit
-3. Otherwise accumulate paragraphs into chunks
-4. After all raw chunks created:
-   → Prepend last 100 chars of previous chunk (overlap)
+1. Split text into sentences (on [.!?\n] boundaries, filter noise < 10 chars)
 
-Why: Preserves semantic meaning at paragraph boundaries.
-The overlap prevents context loss when information spans
-two consecutive chunks.
+2. Create sliding windows of SENTENCE_WINDOW (3) consecutive sentences:
+   window[0] = sentence[0] + sentence[1] + sentence[2]
+   window[1] = sentence[1] + sentence[2] + sentence[3]  ...etc.
+
+3. Embed each window via mxbai-embed-large (1024-dim)
+   — each window captures local context of 3 sentences
+
+4. Compute cosine similarity between every two consecutive windows:
+   similarity[i] = cosine(embedding[i], embedding[i+1])
+
+5. Adaptive breakpoint detection:
+   mean     = average of all similarity scores
+   stddev   = standard deviation of similarity scores
+   threshold = mean - (BREAKPOINT_STDDEV_FACTOR × stddev)
+
+   A break is inserted AFTER window[i] when:
+     similarity[i] < threshold
+   → This means the embedding space shifted significantly → topic changed
+
+6. Assemble chunks from sentences between breakpoints
+
+7. Post-processing (size enforcement):
+   • chunk > MAX_CHUNK_SIZE (800 chars) → recursively split by sentence
+   • chunk < MIN_CHUNK_SIZE (100 chars) → merge with previous chunk
+
+Config:
+  SENTENCE_WINDOW         = 3    (sentences per embedding window)
+  BREAKPOINT_STDDEV_FACTOR = 1.0  (sensitivity; higher = fewer breaks)
+  MAX_CHUNK_SIZE          = 800  (hard cap, chars)
+  MIN_CHUNK_SIZE          = 100  (merge threshold, chars)
+
+Why truly semantic:
+  • Every chunk boundary is decided by EMBEDDING SIMILARITY, not character count
+  • Topic shifts are detected in vector space (mxbai-embed-large)
+  • Adaptive threshold self-tunes to each document's similarity distribution
+  • Result: chunks that are topically cohesive, not just size-bounded
 ```
 
 ### 11.2 Multi-Query Generation
@@ -1198,7 +1227,7 @@ npm run docker:down     # Stop and remove container
 
 ### 15.2 Header vs. Table Chunking Disconnect
 
-**Problem:** Semantic chunking splits a section header ("STAGE 3") from its adjacent scoring table into different chunks. Vector search finds the header but can't link the table.
+**Problem:** Semantic chunking splits a section header (e.g., "STAGE 3") from its adjacent scoring table into different chunks, because the embedding similarity between a short section header and its dense scoring table may not be captured within the 3-sentence window. Vector search finds the header but can't always surface the adjacent table.
 
 **Solution:** Two-pass keyword pinning — directly search for the stage label via ILIKE, then search for scoring keywords (marks, tools, sliders) separately, and pin both at the top of the context window.
 

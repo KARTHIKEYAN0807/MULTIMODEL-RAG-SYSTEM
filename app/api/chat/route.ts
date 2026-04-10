@@ -158,6 +158,8 @@ const BYPASS_PATTERNS = [
   /stage\s*\d/i, /scoring\s*(logic|rubric|criteria)/i, /how\s+many\s+(marks|points)/i,
   /\d+\s*marks?/i, /assessment\s+criteria/i, /grading/i, /checklist/i,
   /selection\s+criteria/i, /eligibility/i, /qualify/i, /score\s*breakdown/i,
+  // Question-number patterns: Q1, Q2 ... Q9 — must not be synonym-expanded
+  /\bq\d\b/i, /\bquestion\s*\d+\b/i, /\btimer\b/i, /\bmax\s*(marks?|score)\b/i,
 ];
 
 async function generateMultiQueries(originalQuery: string): Promise<string[]> {
@@ -176,7 +178,8 @@ async function generateMultiQueries(originalQuery: string): Promise<string[]> {
   try {
     // Add an 8-second timeout so multi-query never blocks retrieval
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
+    // 15s timeout — local llama3.2 needs more time than cloud APIs
+    const timeout = setTimeout(() => controller.abort(), 15000);
 
     const res = await fetch(`${OLLAMA_URL}/api/chat`, {
       method: 'POST',
@@ -355,9 +358,12 @@ export async function POST(req: Request) {
     // This handles the common chunking pattern where the header and its table
     // are split across chunk boundaries.
     const stageMatch = latestMessage.match(/stage\s*(\d+)/i);
+    // Match Q1–Q9 style question references (e.g. "Q3", "Q 3", "Question 3")
+    const questionMatch = latestMessage.match(/\b(?:q|question)\s*(\d+)\b/i);
     let pinnedContext = "";
     const pinnedIds = new Set<string>();
 
+    // ── Stage-based pinning ─────────────────────────────────────────────────
     if (stageMatch) {
       const stageNum = stageMatch[1];
       const stageLabel = `stage ${stageNum}`; // e.g. "stage 3"
@@ -373,13 +379,11 @@ export async function POST(req: Request) {
       pass1.forEach((d: any) => pinnedIds.add(d.id));
 
       // Pass 2 — scoring-keyword chunks (the table rows that don't repeat the stage name)
-      // These terms are common in scoring rubric rows that belong to Stage 3
       const scoringKeywords = [
         'tools', 'checkboxes', 'sliders', 'subjects studied',
         'self-rat', 'circuit analysis', 'control systems',
         'total sum', 'marks', 'scoring criteria'
       ];
-      // Build OR filter: content ilike any of the scoring keywords
       const orFilter = scoringKeywords.map(k => `content.ilike.%${k}%`).join(',');
       const { data: pass2Docs } = await supabase
         .from('documents')
@@ -399,6 +403,53 @@ export async function POST(req: Request) {
           if (d.metadata?.source) sources.add(d.metadata.source);
         });
         console.log(`Keyword-pinned ${pass1.length} stage-label chunks + ${pass2.length} scoring-keyword chunks for "${stageLabel}"`);
+      }
+    }
+
+    // ── Question-number pinning (Q1, Q2, Q3 … Q9) ──────────────────────────
+    // When a user asks "Q3 timer and marks", find the exact chunk for that
+    // question number by searching for "Q3" + adjacent timer/marks keywords.
+    if (questionMatch) {
+      const qNum = questionMatch[1];
+      // Match both "Q3" and "Question 3" styles in the document
+      const qLabels = [`Q${qNum}`, `Question ${qNum}`, `Q ${qNum}`];
+      const orQFilter = qLabels.map(l => `content.ilike.%${l}%`).join(',');
+
+      // Pass 1 — chunks that directly mention the question label
+      const { data: qPass1Docs } = await supabase
+        .from('documents')
+        .select('id, content, metadata')
+        .or(orQFilter)
+        .limit(6);
+
+      const qPass1 = (qPass1Docs || []).filter((d: any) => !pinnedIds.has(d.id));
+      qPass1.forEach((d: any) => pinnedIds.add(d.id));
+
+      // Pass 2 — if query mentions timer/marks, also pin adjacent metadata chunks
+      let qPass2: any[] = [];
+      const wantsTimerOrMarks = /\b(timer|time|marks?|max|score|seconds?|minutes?)\b/i.test(latestMessage);
+      if (wantsTimerOrMarks) {
+        const timerKeywords = ['timer', 'max marks', 'seconds', 'minutes', 'time limit', 'maximum marks'];
+        const timerOrFilter = timerKeywords.map(k => `content.ilike.%${k}%`).join(',');
+        const { data: qPass2Docs } = await supabase
+          .from('documents')
+          .select('id, content, metadata')
+          .or(timerOrFilter)
+          .limit(6);
+        qPass2 = (qPass2Docs || []).filter((d: any) => !pinnedIds.has(d.id));
+        qPass2.forEach((d: any) => pinnedIds.add(d.id));
+      }
+
+      const allQPinned = [...qPass1, ...qPass2];
+      if (allQPinned.length > 0) {
+        // Prepend to existing pinned context (question context goes first)
+        const qPinnedText = `[PINNED — Q${qNum} SPECIFIC CONTENT FROM DOCUMENT]:\n` +
+          allQPinned.map((d: any) => d.content).join('\n\n---\n\n') + '\n\n';
+        pinnedContext = qPinnedText + pinnedContext;
+        allQPinned.forEach((d: any) => {
+          if (d.metadata?.source) sources.add(d.metadata.source);
+        });
+        console.log(`Question-pinned ${qPass1.length} Q${qNum}-label chunks + ${qPass2.length} timer/marks chunks.`);
       }
     }
 
